@@ -1,0 +1,1448 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Rooftop Patang</title>
+<style>
+  :root { --ink: #1c1b19; --muted: #8b877f; --paper: #fff; --me: #c8325a; --them: #2a6fb0; }
+  body.night { --ink: #efe9df; --muted: #a29fb6; --me: #f06a8a; --them: #6aa8ea; }
+  /* the bottom line sits over the sunset glow, so it gets brighter text with a soft shadow */
+  body.night #bottom { --muted: #f6efe6; text-shadow: 0 1px 3px rgba(24, 16, 34, .7); }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; background: var(--paper); color: var(--ink); }
+  body { font: 13px/1.35 ui-monospace, "Cascadia Mono", Consolas, Menlo, monospace; overflow: hidden; }
+  #stage { position: fixed; inset: 0; display: grid; place-items: center; }
+  canvas { display: block; image-rendering: pixelated; touch-action: none; cursor: crosshair; outline: none; }
+  #top { position: fixed; top: max(14px, env(safe-area-inset-top)); left: max(16px, env(safe-area-inset-left)); display: grid; gap: 4px; pointer-events: none; }
+  .row { display: flex; align-items: center; gap: 8px; }
+  .row b { font-size: 16px; font-weight: 600; min-width: 1ch; font-variant-numeric: tabular-nums; }
+  .label { color: var(--muted); }
+  .cells { display: flex; gap: 3px; }
+  .cells i { width: 6px; height: 6px; background: currentColor; }
+  .cells i.off { opacity: .16; }
+  #me { color: var(--me); } #them { color: var(--them); }
+  #pech[hidden] { display: none; }
+  #saw0 { color: var(--me); } #saw1 { color: var(--them); }
+  .hud { position: fixed; left: max(16px, env(safe-area-inset-left)); right: max(16px, env(safe-area-inset-right)); display: flex; justify-content: space-between; gap: 16px; pointer-events: none; }
+  #bottom { bottom: max(14px, env(safe-area-inset-bottom)); align-items: flex-end; }
+  #status { color: var(--muted); }
+  .buttons { display: flex; gap: 24px; }
+  button { pointer-events: auto; font: inherit; color: var(--muted); background: none; border: 0; padding: 10px; margin: -10px; cursor: pointer; }
+  button:hover, button:focus-visible { color: var(--ink); }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="c" tabindex="0" aria-label="Three houses with rooftop terraces on a kite festival afternoon. Hold to pull your kite towards the pointer, let go to give it string. Space and the arrow keys work too."></canvas></div>
+<div id="top">
+  <div class="row" id="me"><b id="s0">0</b><span class="cells" id="d0"></span><span class="label">you</span></div>
+  <div class="row" id="them"><b id="s1">0</b><span class="cells" id="d1"></span><span class="label" id="mood">neighbours</span></div>
+  <div class="row"><span class="label" id="loot"></span></div>
+  <div class="row"><span class="label" id="wind"></span></div>
+  <div class="row" id="pech" hidden><span class="cells" id="saw0"></span><span class="cells" id="saw1"></span><span class="label">pech!</span></div>
+</div>
+<div class="hud" id="bottom">
+  <div id="status" role="status" aria-live="polite"></div>
+  <div class="buttons"><button id="mute" type="button" aria-pressed="false">sound on</button></div>
+</div>
+<script src="../shell.js"></script>
+<script>
+PixelPlays.mount({
+  id: 'rooftop-patang',
+  rules: [
+    'It is kite festival day. Cut the neighbours\' kites before they cut yours. Make 3 cuts to win the day; get cut 3 times and they do.',
+    'Hold to pull: your kite turns towards your finger or cursor and climbs. Let go to give it string: it rides the wind further and further out. Keyboard: hold space to pull, arrows to steer.',
+    'Cross your string over another to start a pech. Pulling hard cuts, and so does letting string run out fast, the dheel. A string that just hangs there loses.',
+    'Next door and the back roof have moods: they come after you, keep away, just fly, or go after each other. You can join their fights.',
+    'When a cut kite drifts low over your terrace, your little brother runs to catch it. Every kite he loots goes on your stash.',
+    'Pull your kite down into the rooftops and it is lost. The day turns to night as the fight goes on.',
+  ],
+});
+</script>
+<script>window.PP_SCENE = { originY: 52, height: 330, zoom: 12, shadowX: .9, shadowY: -.5 };</script>
+<script src="../engine.js"></script>
+<script>
+'use strict';
+
+/* ---------- layout ---------- */
+// x runs screen down-right, y runs screen down-left, z is up, 0 is our roof.
+// Our house has two floors under its terrace; next door has three; the house behind, across the lane, has two
+const FH = 2.4, RISE = FH, STREET = -2 * FH, SPLIT = -.4;
+const OURS = { x0: -7, x1: 6.5, y0: SPLIT, y1: 7.2 };
+const NEXT = { x0: -7, x1: 6.5, y0: -7.2, y1: SPLIT };
+const BACK = { x0: -13.4, x1: -7.6, y0: -7.2, y1: -1.2 };
+const HELPER = { x: -.4, y: 4.6 };
+const MUMTY = { x0: -6.6, y0: SPLIT + .15, x1: -4.2, y1: 2.6, h: 2.5 }; // the stair room, with the water tank on top
+const LINE_A = [-6.2, 6.4], LINE_B = [-3.1, 3.3], LINE_Z = 1.65; // our clothesline, running across the view
+const WIN = 3;
+// a kite that sinks below its flyer's hands has come down among the roofs
+const floorOf = k => k.hy - 12;
+
+/* ---------- palette ---------- */
+const TILE = [[226, 220, 206], [218, 212, 198], [232, 226, 214]], GROUT = [196, 188, 174];
+const CONCRETE = [[176, 170, 160], [184, 178, 168], [192, 186, 176]], TAR = [[70, 66, 66], [80, 76, 74]];
+const NEXT_PAINT = [150, 196, 188], DOOR_WOOD = [118, 62, 42];
+const TRIM = [236, 230, 214], CAP = [204, 196, 182], CHAJJA = [196, 190, 178];
+const MUMTY_C = [214, 196, 168], DOOR = [96, 66, 48], TANK = [40, 40, 44], BLUE_TANK = [60, 112, 168];
+const POT = [176, 92, 58], TULSI = [[44, 92, 48], [70, 120, 56]];
+const LEAF_C = [[34, 70, 44], [52, 96, 52], [86, 126, 62], [126, 152, 72]];
+const BOY = { shirt: [232, 196, 64], stripe: [232, 196, 64], legs: [52, 58, 92], hair: [30, 24, 22], skin: [176, 118, 82] };
+const KID = { shirt: [120, 168, 96], stripe: [236, 232, 220], legs: [70, 66, 60], knee: .8, hair: [26, 22, 20], skin: [182, 124, 88] };
+const RIVAL_C = { shirt: [64, 112, 176], stripe: [236, 234, 228], legs: [58, 52, 46], hair: [24, 20, 18], skin: [160, 108, 76] };
+const BACK_C = { shirt: [196, 70, 60], stripe: [240, 226, 200], legs: [70, 60, 50], hair: [28, 22, 20], skin: [168, 112, 78] };
+const CLOTHES = [[198, 58, 82], [240, 236, 224], [64, 120, 176], [236, 176, 40]];
+const MANJA = [rgb(214, 70, 120), rgb(40, 140, 96), rgb(210, 150, 40)];
+const FAR_KITES = [[rgb(240, 120, 40), rgb(250, 220, 90)], [rgb(120, 60, 160), rgb(240, 200, 220)], [rgb(30, 150, 120), rgb(240, 240, 230)], [rgb(220, 40, 40), rgb(40, 40, 40)], [rgb(250, 200, 30), rgb(60, 120, 200)]];
+const WHITE = rgb(255, 255, 255), BAMBOO = rgb(110, 84, 60), GLASS = rgb(58, 52, 58), GRILL = rgb(34, 32, 36);
+// every kite in the sky is one of these designs, in a pair of these colours
+const DESIGNS = [['dhaal', 'dhaal'], ['patta', 'patta'], ['chaandtara', 'chaand-tara'], ['aankh', 'aankh']];
+const COLOURS = [[214, 44, 78], [250, 212, 64], [38, 104, 178], [244, 244, 236], [70, 150, 90], [240, 120, 40], [120, 60, 160], [36, 34, 40]];
+
+/* ---------- the flyers ---------- */
+const FLYERS = [
+  { at: { x: 1.6, y: 3.2 }, base: 0, look: BOY, scale: .85, name: 'you', their: 'your' },
+  { at: { x: 2.4, y: -3.6 }, base: RISE, look: RIVAL_C, scale: .9, name: 'next door', their: 'next door\'s' },
+  { at: { x: -11.2, y: -5.3 }, base: 0, look: BACK_C, scale: .85, name: 'the back roof', their: 'the back roof\'s' },
+];
+
+/* ---------- the terraces ---------- */
+const inRect = (r, x, y) => x >= r.x0 && x <= r.x1 && y >= r.y0 && y <= r.y1;
+function pick(tones, v, ix, iy) {
+  return rgb(...tones[clamp(Math.floor(v * tones.length + (bayerAt(ix, iy) - .5) * .6), 0, tones.length - 1)]);
+}
+// ours: broken white china tiles set in grout, the kind laid on terraces to keep them cool
+function ourRoof(x, y, ix, iy) {
+  const jx = x * 2.4 + noise(x * 1.6, y * 1.6) * .9, jy = y * 2.4 + noise(y * 1.6 + 9, x * 1.6) * .9;
+  const fx = jx - Math.floor(jx), fy = jy - Math.floor(jy);
+  if (fx < .14 || fy < .14) return rgb(...GROUT);
+  const stain = noise(x * .6 + 4, y * .6) > .7 ? .25 : 0;
+  return pick(TILE, hash(Math.floor(jx), Math.floor(jy)) - stain, ix, iy);
+}
+// the others: plain concrete with patches of tar where the roof leaked
+function theirRoof(x, y, ix, iy) {
+  if (noise(x * .7 + 11, y * .7) > .68) return pick(TAR, noise(x * 3, y * 3), ix, iy);
+  return pick(CONCRETE, .3 + (noise(x * 1.1, y * 1.1) - .5) * .9 + (hash(ix, iy) - .5) * .2, ix, iy);
+}
+function bakeGround() {
+  const lift = RISE * COS * S;
+  for (let iy = 0; iy < H; iy++) for (let ix = 0; ix < W; ix++) {
+    const i = iy * W + ix, up = unproject(ix + .5, iy + .5 + lift);
+    if (inRect(NEXT, up.x, up.y)) {
+      pix[i] = theirRoof(up.x, up.y, ix, iy); ground[i] = 1;
+      zb[i] = (up.x + up.y) / R2 * COS + RISE * SIN;
+      continue;
+    }
+    const g = unproject(ix + .5, iy + .5);
+    if (inRect(OURS, g.x, g.y) || inRect(BACK, g.x, g.y)) {
+      pix[i] = inRect(OURS, g.x, g.y) ? ourRoof(g.x, g.y, ix, iy) : theirRoof(g.x + 30, g.y, ix, iy); ground[i] = 1;
+      zb[i] = (g.x + g.y) / R2 * COS;
+    }
+  }
+}
+
+/* ---------- the houses ---------- */
+// the pixels of every window pane, so they can light up when night falls
+const lamps = [];
+let paintingOpening = null;
+// one wall, painted point by point; walls that reach the street dissolve into it
+function facade(axis, at, a0, a1, z0, z1, wall) {
+  const tone = axis === 'x' ? 1.45 : 2.55; // walls turned from the light are darker
+  for (let a = a0; a <= a1; a += .045) for (let z = z0; z <= z1; z += .045) {
+    const x = axis === 'x' ? at : a, y = axis === 'x' ? a : at, p = project(x, y, z), ix = p.sx | 0, iy = p.sy | 0;
+    if (ix < 0 || iy < 0 || ix >= W || iy >= H) continue;
+    if (z0 === STREET && z - z0 < .6 && bayerAt(ix, iy) > (z - z0) / .6) continue;
+    const i = iy * W + ix;
+    if (p.d <= zb[i]) continue;
+    zb[i] = p.d;
+    paintingOpening = null;
+    const c = pix[i] = wallLook(wall, a - a0, z - STREET, tone, ix, iy);
+    const o = paintingOpening;
+    // some rooms will have their lights on tonight, some won't
+    if (c === GLASS && o && o.kind !== 'vent' && hash(o.u0 * 7 + at, o.h0 * 3) > .3) lamps.push(i);
+  }
+  // concrete sunshades over the doors and windows
+  for (const o of wall.openings) {
+    if (!o.shade) continue;
+    const [px, py, pz] = onWall(axis, at, a0, o.u0 - .22, o.h1, 0), [qx, qy, qz] = onWall(axis, at, a0, o.u1 + .22, o.h1 + .1, .36);
+    box(Math.min(px, qx), Math.min(py, qy), pz, Math.max(px, qx), Math.max(py, qy), qz, CHAJJA, o.u0 * 7 | 0);
+  }
+}
+// a point on a wall: u along it, h above the street, out away from it
+function onWall(axis, at, a0, u, h, out) {
+  return axis === 'x' ? [at + out, a0 + u, STREET + h] : [a0 + u, at + out, STREET + h];
+}
+// bare brick, for next door's newest floor that never got plastered
+const BRICKS = [[170, 86, 60], [180, 98, 66], [158, 80, 56]], MORTAR = [190, 172, 150];
+function brick(u, h) {
+  const row = Math.floor(h / .22), fu = (u + (row % 2) * .25) / .5, col = Math.floor(fu);
+  if (h / .22 - row < .22 || fu - col < .1) return MORTAR;
+  return BRICKS[hash(col, row) * 3 | 0];
+}
+// an ordinary house wall: limewash over brick with a darker plinth, damp stains, and only the
+// openings the rooms behind it need. Under each sunshade the wall sits in a strip of shadow
+function wallLook(wall, u, h, tone, ix, iy) {
+  const level = dz => clamp(Math.floor(tone + dz + (bayerAt(ix, iy) - .5) * .5), 0, 4);
+  for (const o of wall.openings) {
+    if (u >= o.u0 && u <= o.u1 && h >= o.h0 && h <= o.h1) { paintingOpening = o; return openingLook(o, u, h, level); }
+  }
+  let shade = 0;
+  for (const o of wall.openings) {
+    if (o.shade && u > o.u0 - .22 && u < o.u1 + .22 && h < o.h1 && h > o.h1 - .32) shade = -1;
+    if (o.balcony && u > o.u0 && u < o.u1 && h < o.h0 && h > o.h0 - .45) shade = -1.2;
+  }
+  for (const r of wall.bare || []) {
+    if (u >= r.u0 && u <= r.u1 && h >= r.h0 && h <= r.h1) return rampOf(brick(u, h))[level(shade)];
+  }
+  if (wall.brickAbove != null && h >= wall.brickAbove) return rampOf(brick(u, h))[level(shade)];
+  if (h < .55) return rampOf(wall.plinth)[level(shade - .2)];
+  const damp = noise(u * 1.8, h * .5) > .7 || (h < 1.4 && noise(u * 3, 7) > .6) ? -.7 : 0;
+  return rampOf(wall.paint)[level(shade + damp + (noise(u * .7, h * .7) - .5) * .35)];
+}
+function openingLook(o, u, h, level) {
+  const du = Math.min(u - o.u0, o.u1 - u), dh = Math.min(h - o.h0, o.h1 - h);
+  const trim = rampOf(TRIM), wood = rampOf(o.color || DOOR_WOOD);
+  if (o.kind === 'hole') return ((u - o.u0) * 4.5 | 0) % 2 === 0 && du > .08 ? GRILL : GLASS; // no frame yet
+  if (o.kind === 'plate') return dh > .06 && du > .06 && (h - o.h0) / (o.h1 - o.h0) > .45 && (h - o.h0) / (o.h1 - o.h0) < .6 ? trim[3] : rgb(70, 52, 40);
+  if (du < .08 || dh < .08) return trim[level(.2)];
+  if (o.kind === 'vent') return ((h - o.h0) * 16 | 0) % 2 ? GLASS : trim[level(-.6)];
+  if (o.kind === 'door') {
+    const panel = Math.abs(h - (o.h0 + o.h1) / 2) < .05 || Math.abs(u - (o.u0 + o.u1) / 2) < .04;
+    return wood[level(panel ? -1.2 : -.5 + ((u * 8 | 0) % 2) * .3)];
+  }
+  // a window: iron bars in front, one wooden shutter pulled to, the room dark behind the other
+  if (((u - o.u0) * 4.5 | 0) % 2 === 0 && du > .1) return GRILL;
+  if (Math.abs(h - (o.h0 + o.h1) / 2) < .04) return GRILL;
+  return u < (o.u0 + o.u1) / 2 ? wood[level(-.3 + ((h * 9 | 0) % 2) * .25)] : GLASS;
+}
+// our street front, along x: the main door with a nameplate, a couple of windows, and the balcony upstairs
+const OUR_FRONT = {
+  paint: [248, 214, 150], plinth: [150, 86, 70],
+  openings: [
+    { kind: 'door', u0: 2.4, u1: 3.5, h0: .12, h1: 2.05, shade: true, color: [118, 62, 42] },
+    { kind: 'plate', u0: 3.75, u1: 4.15, h0: 1.35, h1: 1.62 },
+    { kind: 'window', u0: 5.4, u1: 6.7, h0: .85, h1: 1.95, shade: true, color: [70, 124, 96] },
+    { kind: 'window', u0: 10.4, u1: 11.3, h0: 1, h1: 1.8, shade: true, color: [70, 124, 96] },
+    { kind: 'door', u0: 2.9, u1: 3.9, h0: 2.55, h1: 4.4, color: [70, 124, 96], balcony: true },
+    { kind: 'window', u0: 5, u1: 6.1, h0: 3.25, h1: 4.35, color: [70, 124, 96] },
+    { kind: 'window', u0: 9.9, u1: 11.1, h0: 3.25, h1: 4.35, shade: true, color: [70, 124, 96] },
+  ],
+  bare: [{ u0: 12.2, u1: 13.1, h0: .6, h1: 1.2 }], // where the plaster has come away
+};
+// our side wall onto the lane: blank, but for a ventilator, the window with the cooler, and the meter
+const OUR_SIDE = {
+  paint: [244, 208, 144], plinth: [150, 86, 70],
+  openings: [
+    { kind: 'vent', u0: 2.6, u1: 3.1, h0: 1.75, h1: 2.1 },
+    { kind: 'window', u0: 4.4, u1: 5.3, h0: 3.3, h1: 4.25, shade: true, color: [70, 124, 96] },
+    { kind: 'vent', u0: 1.8, u1: 2.3, h0: 4.1, h1: 4.45 },
+  ],
+  bare: [{ u0: 5.8, u1: 6.9, h0: .55, h1: 1.25 }],
+};
+// next door: plastered on the first two floors, the top floor added later and left in bare brick
+const NEXT_SIDE = {
+  paint: [156, 198, 190], plinth: [110, 120, 126], brickAbove: 2 * FH,
+  openings: [
+    { kind: 'vent', u0: 1.2, u1: 1.65, h0: 1.7, h1: 2.05 },
+    { kind: 'window', u0: 3.6, u1: 4.7, h0: .85, h1: 1.95, shade: true, color: [64, 100, 150] },
+    { kind: 'window', u0: 2.2, u1: 3.4, h0: 3.25, h1: 4.35, shade: true, color: [64, 100, 150] },
+    { kind: 'hole', u0: 3.1, u1: 3.95, h0: 5.75, h1: 6.6 },
+  ],
+};
+const NEXT_PARTY = { paint: NEXT_PAINT, plinth: NEXT_PAINT, brickAbove: 0, openings: [{ kind: 'vent', u0: 9.4, u1: 9.85, h0: 6.3, h1: 6.65 }] };
+// the house behind, across the lane: pale pink, a door and a couple of windows
+const BACK_FRONT = {
+  paint: [232, 188, 180], plinth: [130, 92, 90],
+  openings: [
+    { kind: 'door', u0: 1, u1: 1.9, h0: .12, h1: 2.05, shade: true, color: [70, 100, 140] },
+    { kind: 'window', u0: 3.4, u1: 4.5, h0: .9, h1: 1.95, shade: true, color: [70, 100, 140] },
+    { kind: 'window', u0: 1.6, u1: 2.7, h0: 3.3, h1: 4.35, shade: true, color: [70, 100, 140] },
+    { kind: 'window', u0: 4.2, u1: 5, h0: 3.4, h1: 4.2, color: [70, 100, 140] },
+  ],
+};
+function wallBits() {
+  // the first-floor balcony on our front: a slab, an iron railing, a towel drying and a pot
+  const y = OURS.y1, x0 = OURS.x0 + 2, x1 = OURS.x0 + 6.9, z = STREET + FH, out = .85;
+  box(x0, y, z - .14, x1, y + out, z + .02, CHAJJA, 21);
+  const rail = rgb(44, 42, 46);
+  for (let x = x0 + .05; x <= x1; x += .2) for (let h = 0; h < .9; h += .04) plot(x, y + out - .04, z + h, rail);
+  for (let yy = y; yy <= y + out; yy += .2) for (let h = 0; h < .9; h += .04) { plot(x0 + .02, yy, z + h, rail); plot(x1 - .02, yy, z + h, rail); }
+  for (let x = x0; x <= x1; x += .03) { plot(x, y + out - .04, z + .9, rail); plot(x, y + out - .04, z + .45, rail); }
+  for (let x = x0 + 2.6; x < x0 + 3.3; x += .03) for (let h = .25; h < .95; h += .03) plot(x, y + out, z + h, rgb(226, 88, 70)); // a towel
+  box(x1 - .55, y + .2, z, x1 - .2, y + .55, z + .3, POT, 4);
+  for (let k = 0; k < 6; k++) sphere(x1 - .37 + (hash(k, 1) - .5) * .3, y + .37 + (hash(k, 2) - .5) * .3, z + .45 + hash(k, 3) * .25, .12, TULSI[k % 2], 'rough');
+  // on our side wall: a desert cooler in the window, and the electricity meter by the ground
+  const sx = OURS.x1, sy = OURS.y0;
+  box(sx, sy + 4.3, STREET + 3.15, sx + .55, sy + 5.4, STREET + 4.05, [200, 194, 176], 22);
+  for (let yy = sy + 4.4; yy < sy + 5.3; yy += .045) for (let h = 3.3; h < 3.95; h += .12) plot(sx + .56, yy, STREET + h, rgb(150, 144, 128));
+  box(sx, sy + 1, STREET + 1.15, sx + .14, sy + 1.55, STREET + 1.85, [118, 124, 130], 23);
+  // wires sagging from the meter up to the roof
+  for (let t = 0; t <= 1; t += .01) plot(sx + .05, sy + 1.27 + t * 2, STREET + 1.85 + t * (2 * FH - 1.7) - Math.sin(t * Math.PI) * .4, rgb(40, 38, 40));
+}
+function parapet(x0, y0, x1, y1, z, color, seed) {
+  box(x0, y0, z, x1, y1, z + .6, color, seed);
+  box(x0 - .03, y0 - .03, z + .6, x1 + .03, y1 + .03, z + .7, CAP, seed + 1);
+  const along = x1 - x0 > y1 - y0;
+  for (let t = 0; t <= 1; t += .04) castShadow(along ? lerp(x0, x1, t) : (x0 + x1) / 2, along ? (y0 + y1) / 2 : lerp(y0, y1, t), z + .65, .22);
+}
+function buildHouses() {
+  facade('y', BACK.y1, BACK.x0, BACK.x1, STREET, 0, BACK_FRONT);
+  facade('y', OURS.y1, OURS.x0, OURS.x1, STREET, 0, OUR_FRONT);
+  facade('x', OURS.x1, OURS.y0, OURS.y1, STREET, 0, OUR_SIDE);
+  facade('x', NEXT.x1, NEXT.y0, NEXT.y1, STREET, RISE, NEXT_SIDE);
+  // the part of their wall that rises above our terrace: their new floor, in bare brick
+  facade('y', SPLIT, NEXT.x0, NEXT.x1, 0, RISE, NEXT_PARTY);
+  wallBits();
+  const pipe = () => [128, 124, 118];
+  capsule([OURS.x1 + .08, SPLIT, RISE + .3], [OURS.x1 + .08, SPLIT, STREET + .8], .08, .08, pipe, 'solid');
+  capsule([-2, SPLIT + .1, RISE + .1], [-2, SPLIT + .1, .05], .07, .07, pipe, 'solid');
+  // parapets around all three terraces
+  const our = [222, 196, 150], their = [196, 190, 180], back = [214, 182, 174];
+  parapet(OURS.x0, OURS.y1 - .25, OURS.x1, OURS.y1, 0, our, 1);
+  parapet(OURS.x1 - .25, OURS.y0, OURS.x1, OURS.y1 - .25, 0, our, 3);
+  parapet(OURS.x0, OURS.y0, OURS.x0 + .25, OURS.y1 - .25, 0, our, 5);
+  parapet(NEXT.x0, NEXT.y0, NEXT.x1, NEXT.y0 + .25, RISE, their, 7);
+  parapet(NEXT.x0, NEXT.y0 + .25, NEXT.x0 + .25, NEXT.y1, RISE, their, 9);
+  parapet(NEXT.x1 - .25, NEXT.y0 + .25, NEXT.x1, NEXT.y1 - .25, RISE, their, 11);
+  parapet(NEXT.x0 + .25, NEXT.y1 - .25, NEXT.x1, NEXT.y1, RISE, their, 13);
+  parapet(BACK.x0, BACK.y0, BACK.x1, BACK.y0 + .25, 0, back, 15);
+  parapet(BACK.x0, BACK.y0 + .25, BACK.x0 + .25, BACK.y1, 0, back, 17);
+  parapet(BACK.x1 - .25, BACK.y0 + .25, BACK.x1, BACK.y1, 0, back, 19);
+  parapet(BACK.x0 + .25, BACK.y1 - .25, BACK.x1 - .25, BACK.y1, 0, back, 21);
+  for (let x = OURS.x0 + .6; x < OURS.x1 - .4; x += .55) {
+    for (let a = 0; a < .18; a += .03) for (let z = .22; z < .4; z += .03) plot(x + a, OURS.y1 + .01, z, rgb(120, 96, 70));
+  }
+  // the back roof's white water tank
+  capsule([-12.4, -6.3, .3], [-12.4, -6.3, 1.3], .55, .53, () => [226, 226, 220], 'gloss');
+  for (let z = .4; z < 1.4; z += .25) castShadow(-12.4, -6.3, z, .55);
+  // next door's blue water tank and a clothesline with a sari
+  capsule([-3.6, -5.4, RISE + .3], [-3.6, -5.4, RISE + 1.4], .62, .6, () => BLUE_TANK, 'gloss');
+  shadowBase = RISE;
+  for (let z = RISE + .4; z < RISE + 1.5; z += .25) castShadow(-3.6, -5.4, z, .6);
+  for (const [x, y] of [[-1, -6.2], [4.2, -6.2]]) capsule([x, y, RISE], [x, y, RISE + 1.6], .05, .05, () => [90, 86, 80], 'solid');
+  const sari = [[222, 92, 52], [240, 196, 60]];
+  for (let a = -.9; a <= 4.1; a += .045) for (let b = 0; b < 1.1; b += .045) {
+    plot(a, -6.2, RISE + 1.55 - b - Math.sin(a * 1.4) * .08, rgb(...sari[(b > .85) | 0]));
+  }
+  for (let a = -.8; a < 4; a += .4) castShadow(a, -6.2, RISE + 1.2, .35);
+  buildTheirStash();
+  shadowBase = 0;
+}
+// a kite lying flat on the ground: a diamond split in two colours with a dark edge
+function flatKite(cx, cy, z, rot, c1, c2, s) {
+  const cr = Math.cos(rot), sr = Math.sin(rot), ink = rgb(60, 48, 40), a1 = rgb(...c1), a2 = rgb(...c2);
+  for (let a = -s; a <= s; a += .03) for (let b = -s; b <= s; b += .03) {
+    const e = Math.abs(a) / s + Math.abs(b) / (s * .85);
+    if (e > 1) continue;
+    plot(cx + a * cr - b * sr, cy + a * sr + b * cr, z, e > .86 ? ink : b < 0 ? a1 : a2);
+  }
+}
+// next door's festival stash, next to their flyer: a striped durrie with a pile of spare kites,
+// charkhis of string, a transistor radio, a plate of til-gud laddoos, and a plastic chair by the tank
+function buildTheirStash() {
+  const z = RISE;
+  const stripes = [[176, 52, 52], [226, 170, 60], [52, 64, 110]].map(c => rgb(...c));
+  for (let x = -2.5; x <= .5; x += .045) for (let y = -3.5; y <= -1.5; y += .045) plot(x, y, z + .02, stripes[((x + 3) * 3.4 | 0) % 3]);
+  const pile = [[[214, 44, 78], [250, 212, 64]], [[38, 104, 178], [244, 244, 236]], [[70, 150, 90], [250, 230, 120]], [[240, 120, 40], [250, 220, 90]], [[120, 60, 160], [240, 200, 220]]];
+  pile.forEach(([c1, c2], k) => flatKite(-1.5 + (hash(k, 1) - .5) * 1.1, -2.5 + (hash(k, 2) - .5) * .9, z + .05 + k * .02, hash(k, 3) * 3, c1, c2, .6));
+  for (let t = 0; t <= 1; t += .1) {
+    const end = t < .22 || t > .78;
+    sphere(-.3 + t * .5, -1.85, z + .2, end ? .19 : .15, end ? [150, 100, 60] : [214, 70, 120], 'solid');
+    sphere(.15, -3.1, z + .08 + t * .5, end ? .19 : .15, end ? [150, 100, 60] : [40, 150, 100], 'solid');
+  }
+  castShadow(-.05, -1.85, z + .2, .3); castShadow(.15, -3.1, z + .35, .25);
+  box(-2.35, -1.95, z, -1.7, -1.6, z + .38, [62, 54, 50], 3);
+  for (let x = -2.25; x < -1.95; x += .07) for (let h = .08; h < .3; h += .07) plot(x, -1.59, z + h, rgb(176, 172, 166));
+  capsule([-1.78, -1.75, z + .38], [-1.55, -1.85, z + 1.1], .025, .025, () => [176, 176, 182], 'solid');
+  castShadow(-2, -1.78, z + .25, .35);
+  for (let a = 0; a < 6.3; a += .04) for (let r = 0; r < .34; r += .04) plot(-.4 + Math.cos(a) * r, -2.95 + Math.sin(a) * r, z + .06, r > .27 ? rgb(150, 154, 160) : rgb(200, 202, 206));
+  for (let k = 0; k < 6; k++) sphere(-.4 + Math.cos(k * 1.1) * .14, -2.95 + Math.sin(k * 1.1) * .14, z + .15, .085, [176, 120, 62], 'rough');
+  const chair = [236, 236, 230];
+  box(-1.2, -4.95, z + .44, -.55, -4.3, z + .53, chair, 5);
+  box(-1.2, -5.01, z + .53, -.55, -4.91, z + 1.1, chair, 6);
+  for (const [x, y] of [[-1.15, -4.9], [-.6, -4.9], [-1.15, -4.35], [-.6, -4.35]]) capsule([x, y, z], [x, y, z + .44], .04, .035, () => chair, 'solid');
+  for (let h = .2; h < 1.1; h += .25) castShadow(-.88, -4.7, z + h, .34);
+  [[250, 200, 40], [214, 44, 78], [60, 130, 200]].forEach((c, k) => leanKite(1 + k * .55, NEXT.y0 + .3, z, rgb(...c), rgb(244, 240, 230), 'y'));
+}
+// a kite leaning on a wall: 'y' lays it against a wall that faces +y, 'x' against one that faces +x
+function leanKite(x, y, z, c1, c2, wall) {
+  for (let a = -.24; a <= .24; a += .03) for (let b = 0; b <= .6; b += .03) {
+    if (Math.abs(a) > .24 * (1 - Math.abs(b - .3) / .3)) continue;
+    if (wall === 'y') plot(x + a, y + .05 + b * .25, z + .1 + b, a < 0 ? c1 : c2);
+    else plot(x + .05 + b * .25, y + a, z + .1 + b, a < 0 ? c1 : c2);
+  }
+}
+function buildOurRoof() {
+  const m = MUMTY;
+  box(m.x0, m.y0, 0, m.x1, m.y1, m.h, MUMTY_C, 7);
+  box(m.x1, m.y0 + .7, 0, m.x1 + .04, m.y0 + 1.7, 1.9, DOOR, 2); // the stair door
+  box(m.x0 + .8, m.y1, 1.1, m.x0 + 1.6, m.y1 + .04, 1.7, [80, 96, 110], 4); // a small window
+  box(m.x0 - .05, m.y0 - .05, m.h, m.x1 + .05, m.y1 + .05, m.h + .12, [190, 172, 146], 5);
+  const tx = (m.x0 + m.x1) / 2, ty = (m.y0 + m.y1) / 2;
+  capsule([tx, ty, m.h + .2], [tx, ty, m.h + 1.3], .72, .7, () => TANK, 'gloss');
+  sphere(tx, ty, m.h + 1.42, .22, TANK, 'gloss');
+  const steel = () => [96, 96, 100], ax = m.x1 - .3, ay = m.y0 + .2;
+  capsule([ax, ay, m.h + .1], [ax, ay, m.h + 2.1], .04, .04, steel, 'solid');
+  for (const [z, w] of [[1.6, .7], [1.85, .55], [2.05, .4]]) capsule([ax - w, ay, m.h + z], [ax + w, ay, m.h + z], .03, .03, steel, 'solid');
+  for (let x = m.x0; x <= m.x1; x += .4) for (let y = m.y0; y <= m.y1; y += .4) castShadow(x, y, m.h, .4);
+  for (let z = m.h; z < m.h + 1.4; z += .3) castShadow(tx, ty, z, .7);
+  castShadow(ax, ay, m.h + 1.8, .3);
+  capsule([FLAG.x, FLAG.y, 0], [FLAG.x, FLAG.y, FLAG.top + .05], .05, .04, () => [176, 136, 84], 'solid');
+  for (let z = .4; z < FLAG.top; z += .4) castShadow(FLAG.x, FLAG.y, z, .06);
+  for (const [x, y] of [LINE_A, LINE_B]) {
+    capsule([x, y, 0], [x, y, LINE_Z + .05], .05, .05, () => [110, 104, 96], 'solid');
+    castShadow(x, y, 1.2, .1);
+  }
+  for (const [x, y, big] of [[5.2, 3.1, 1], [5.5, 1.1, 0], [3.9, 6.1, 0]]) {
+    const h = big ? .7 : .38;
+    box(x - .28, y - .28, 0, x + .28, y + .28, h, big ? [224, 216, 200] : POT, x * 3 | 0);
+    for (let k = 0; k < (big ? 9 : 5); k++) {
+      sphere(x + (hash(k, x) - .5) * .4, y + (hash(k, y) - .5) * .4, h + .15 + hash(k, 3) * (big ? .5 : .25), .14, TULSI[k % 2], 'rough');
+    }
+    castShadow(x, y, h, .35);
+  }
+  // spare kites leaning on the stair room, waiting their turn
+  [[214, 44, 78], [70, 150, 90], [250, 200, 40]].forEach((c, k) => leanKite(m.x1 + .1, m.y1 - .5 - k * .55, 0, rgb(...c), rgb(244, 240, 230), 'x'));
+}
+const NEEM = { x: -8.3, y: 8.3, z: 1.2 };
+const FLAG = { x: OURS.x1 - .45, y: OURS.y1 - .45, top: 3.3 }; // a bamboo pole tied at our parapet corner
+function growNeem() {
+  const cx = NEEM.x, cy = NEEM.y, cz = NEEM.z;
+  capsule([cx + .3, cy + .2, STREET - .5], [cx, cy, cz - .4], .3, .2, () => [92, 76, 64], 'rough');
+  for (let k = 0; k < 300; k++) {
+    const a = hash(k, 21) * 6.283, nz = hash(k, 22) * 2 - 1, flat = Math.sqrt(1 - nz * nz), d = .4 + hash(k, 23) * .6;
+    const x = cx + Math.cos(a) * flat * d * 1.9, y = cy + Math.sin(a) * flat * d * 1.9, z = cz + nz * d * 1.2;
+    const lit = -Math.cos(a) * .4 + Math.sin(a) * .3 + nz * .6;
+    capture = [];
+    sphere(x, y, z, .2 + hash(k, 24) * .16, LEAF_C[clamp(Math.floor((.45 + lit * .4 + (hash(k, 25) - .5) * .5) * 4), 0, 3)], 'rough');
+    leaves.push({ x, y, z: z + 2, k, r: .35, pixels: capture });
+    capture = null;
+  }
+}
+function bake() {
+  zb.fill(-1e9);
+  pix.fill(WHITE);
+  bakeGround();
+  groundZ.set(zb);
+  buildHouses();
+  buildOurRoof();
+  growNeem();
+  bakeOcclusion();
+  staticShadow.set(shadowMask);
+  applyShadows(groundZ);
+  bakedPix.set(pix);
+  bakedZ.set(zb);
+}
+
+/* ---------- kites ---------- */
+// all kite flying happens in screen space: pixels, with y pointing down.
+// Pulling turns the kite towards where you point and drives it there; a tight string climbs in the wind.
+// Letting go gives it string: it settles nose-up and rides the wind out, further the longer you let it run
+const THRUST = 230, LIFT = 110, DRAG = 1.7, TOP_SPEED = 150, TURN = 3.6, SINK = 26, REEL_IN = 16, PAY_OUT = 55;
+const L_MAX = 400, REEL_FLOOR = 130, SAW = 1.15, PECH_GRACE = .35;
+const BOT = [ // the neighbours get sharper and keener as the day goes on
+  { skill: .72, think: .16, hunt: .4 },
+  { skill: .85, think: .13, hunt: .48 },
+  { skill: .97, think: .11, hunt: .55 },
+  { skill: 1.06, think: .09, hunt: .62 },
+  { skill: 1.14, think: .08, hunt: .7 },
+];
+const level = () => BOT[Math.min(G.score[0] + G.score[1], BOT.length - 1)];
+function newKite(side) {
+  return {
+    side, x: 0, y: 0, vx: 0, vy: 0, nose: -Math.PI / 2, L: 100, pulling: false, paying: false, steer: null, aimX: 0, aimY: 0,
+    state: 'fly', think: 0, hx: 0, hy: 0, tactic: null, mood: 'cruise', moodT: 3 + Math.random() * 3, prey: 0, colors: null, design: 'dhaal',
+  };
+}
+function handGuess(k) {
+  const f = FLYERS[k.side], p = project(f.at.x, f.at.y, f.base + 2.5);
+  return { x: p.sx, y: p.sy };
+}
+// a fresh kite going up from the flyer's hands: it climbs on its own for a moment while string runs out
+function launchKite(side) {
+  const k = newKite(side), h = handGuess(k);
+  Object.assign(k, { hx: h.x, hy: h.y, x: h.x, y: h.y - 14, L: 16, launching: true, launchT: 0, calm: 2 });
+  // each one goes up into its own part of the sky: you straight up, next door to the right, the back roof to the left
+  aim(k, h.x + [0, 55, -50][side] + G.wind * .5, 40 + Math.random() * 40);
+  // every kite is random, but never the same design or main colour as another one in the sky
+  const others = G.kites.filter((o, s) => s !== side && o && o.state === 'fly');
+  const designs = DESIGNS.map(d => d[0]).filter(d => !others.some(o => o.design === d));
+  const mains = COLOURS.map((c, j) => j).filter(j => !others.some(o => o.main === j));
+  const main = mains[(Math.random() * mains.length) | 0];
+  let second = (Math.random() * COLOURS.length) | 0;
+  if (second === main) second = (second + 3) % COLOURS.length;
+  k.design = designs[(Math.random() * designs.length) | 0];
+  k.main = main;
+  k.colors = [rgb(...COLOURS[main]), rgb(...COLOURS[second])];
+  return k;
+}
+const angDiff = (a, b) => Math.atan2(Math.sin(a - b), Math.cos(a - b));
+const turnTo = (k, want, rate) => { k.nose += clamp(angDiff(want, k.nose), -rate, rate); };
+// how far away a kite looks: the more string out, the smaller it gets
+const kiteSize = k => clamp(1.45 - (k.L - 90) / (L_MAX - 90) * .8, .65, 1.45);
+function stepKite(k, dt) {
+  const wind = G.wind;
+  if (k.state === 'loose') {
+    // cut free: it drifts away on the wind, turning over and slowly sinking
+    k.vx += (wind * 1.4 - k.vx) * dt * .7; k.vy += (20 - k.vy) * dt * .5;
+    k.nose += dt * 2.4;
+    k.x += k.vx * dt; k.y += k.vy * dt;
+    return;
+  }
+  if (k.state !== 'fly') return;
+  const taut = Math.hypot(k.x - k.hx, k.y - k.hy) >= k.L - 2;
+  // the wind lifts less the higher a kite goes, so they float high without piling up against the top
+  const ceiling = clamp((k.y - 14) / 55, 0, 1);
+  k.paying = false; k.run = 0;
+  if (k.pulling) {
+    if (k.steer != null) k.nose += k.steer * TURN * dt;
+    else turnTo(k, Math.atan2(k.aimY - k.y, k.aimX - k.x), TURN * dt);
+    k.vx += Math.cos(k.nose) * THRUST * dt; k.vy += Math.sin(k.nose) * THRUST * dt;
+    if (taut) k.vy -= LIFT * (.4 + .6 * ceiling) * dt;
+    // going up, string is let out as it climbs; otherwise pulling reels it in, but only while there is
+    // plenty out: on a short string you just hold it, so a tight kite can still swing up overhead
+    if (k.launching) k.L = Math.min(L_MAX, k.L + 75 * dt);
+    else if (k.L > REEL_FLOOR) k.L = Math.max(REEL_FLOOR, k.L - REEL_IN * dt);
+  } else {
+    // a free kite noses up into the wind and bobs a little
+    turnTo(k, -Math.PI / 2 - Math.sign(wind) * .3 + Math.sin(G.time * 1.7 + k.side * 2) * .25, 1.6 * dt);
+    k.vx += (wind - k.vx) * .9 * dt;
+    k.vy += SINK * dt;
+    // the wind carries it away from you, up and downwind
+    const gust = clamp(Math.abs(wind) / 34, .3, 1), dx = k.x - k.hx, dy = k.y - k.hy, d = Math.hypot(dx, dy) || 1;
+    k.vx += dx / d * 55 * gust * dt; k.vy += dy / d * 55 * gust * (dy < 0 ? ceiling : 1) * dt;
+    if (taut) {
+      k.vy -= LIFT * gust * .62 * ceiling * dt;
+      // and the string runs out through your fingers as fast as it pulls away
+      k.run = Math.max(0, (k.vx * dx + k.vy * dy) / d);
+      if (k.L < L_MAX) { k.L = Math.min(L_MAX, k.L + Math.min(PAY_OUT, k.run) * dt); k.paying = k.run > 4; }
+    }
+  }
+  const drag = 1 - DRAG * dt;
+  k.vx *= drag; k.vy *= drag;
+  const sp = Math.hypot(k.vx, k.vy);
+  if (sp > TOP_SPEED) { k.vx *= TOP_SPEED / sp; k.vy *= TOP_SPEED / sp; }
+  k.x += k.vx * dt; k.y += k.vy * dt;
+  // the string holds it to the flyer's hand
+  const dx = k.x - k.hx, dy = k.y - k.hy, d = Math.hypot(dx, dy);
+  if (d > k.L) {
+    const nx = dx / d, ny = dy / d, out = k.vx * nx + k.vy * ny;
+    k.x = k.hx + nx * k.L; k.y = k.hy + ny * k.L;
+    if (out > 0) { k.vx -= out * nx; k.vy -= out * ny; }
+  }
+  if (k.x < 6) { k.x = 6; k.vx = Math.abs(k.vx) * .4; }
+  if (k.x > W - 6) { k.x = W - 6; k.vx = -Math.abs(k.vx) * .4; }
+  if (k.y < 6) { k.y = 6; k.vy = Math.abs(k.vy) * .4; }
+}
+// the string sags between hand and kite, more when it is slack
+function stringPoints(k, n = 18) {
+  const ax = k.hx, ay = k.hy, bx = k.x, by = k.y, d = Math.hypot(bx - ax, by - ay);
+  const sag = Math.min(60, 6 + Math.max(0, k.L - d) * .5 + d * .05);
+  const cx = (ax + bx) / 2, cy = (ay + by) / 2 + sag, pts = [];
+  for (let j = 0; j <= n; j++) {
+    const t = j / n, u = 1 - t;
+    pts.push([u * u * ax + 2 * u * t * cx + t * t * bx, u * u * ay + 2 * u * t * cy + t * t * by]);
+  }
+  return pts;
+}
+function crossing(a, b) {
+  for (let i = 2; i < a.length - 1; i++) for (let j = 2; j < b.length - 1; j++) {
+    const [p1x, p1y] = a[i], [p2x, p2y] = a[i + 1], [q1x, q1y] = b[j], [q2x, q2y] = b[j + 1];
+    const rx = p2x - p1x, ry = p2y - p1y, sx = q2x - q1x, sy = q2y - q1y, den = rx * sy - ry * sx;
+    if (!den) continue;
+    const t = ((q1x - p1x) * sy - (q1y - p1y) * sx) / den, u = ((q1x - p1x) * ry - (q1y - p1y) * rx) / den;
+    if (t >= 0 && t <= 1 && u >= 0 && u <= 1) return { x: p1x + rx * t, y: p1y + ry * t };
+  }
+  return null;
+}
+
+/* ---------- the neighbours ---------- */
+// each one changes its mind every few seconds: come after you, go after the other neighbour,
+// keep its distance, or just enjoy the sky
+const flying = k => k && k.state === 'fly' && !k.launching;
+// a kite that has only just gone up gets a moment before anyone can pech it
+const fighting = k => flying(k) && k.calm <= 0;
+function pickMood(b) {
+  const cfg = level(), r = Math.random();
+  b.mood = r < cfg.hunt ? 'hunt' : r < cfg.hunt + (1 - cfg.hunt) / 2 ? 'avoid' : 'cruise';
+  b.moodT = b.mood === 'hunt' ? 7 + Math.random() * 6 : 5 + Math.random() * 5;
+  const other = 3 - b.side;
+  b.prey = Math.random() < .62 || !flying(G.kites[other]) ? 0 : other;
+}
+const MOODS = { avoid: 'keeping away', cruise: 'just flying' };
+function aim(k, x, y) { k.aimX = x; k.aimY = y; }
+function pechOf(k) {
+  for (const p of G.pechs.values()) if (p.a === k || p.b === k) return p;
+  return null;
+}
+function botThink(b, dt) {
+  const cfg = level();
+  if ((b.moodT -= dt) <= 0) pickMood(b);
+  b.think -= dt;
+  if (b.think > 0) return;
+  b.think = cfg.think * (.8 + Math.random() * .4);
+  // whatever its mood, it will not let the kite go down among the roofs
+  if (b.y > floorOf(b) - 70 || (b.vy > 35 && b.y > floorOf(b) - 110)) {
+    aim(b, b.x + (b.x > W / 2 ? -40 : 40), b.y - 120); b.pulling = true; return;
+  }
+  const pech = pechOf(b);
+  if (pech) {
+    const foe = pech.a === b ? pech.b : pech.a;
+    if (!b.tactic) b.tactic = b.mood === 'avoid' ? 'escape' : Math.random() < .55 ? 'kheench' : 'dheel';
+    if (b.tactic === 'dheel') { b.pulling = Math.random() > .9; aim(b, b.x, b.y - 60); return; }
+    // pull hard, up and away from the other kite, so its string saws across
+    const away = b.tactic === 'escape' ? Math.sign(b.x - pech.x.x) || 1 : Math.sign(b.x - foe.x) || 1;
+    aim(b, b.x + away * 60, b.y - 70);
+    b.pulling = Math.random() < (b.tactic === 'escape' ? .95 : .55 + cfg.skill * .35);
+    return;
+  }
+  b.tactic = null;
+  const p = G.kites[b.prey];
+  if (b.mood === 'hunt' && flying(p)) {
+    // a point just past the other string, up near its kite, so its own string will lie across
+    const ux = p.x - p.hx, uy = p.y - p.hy, len = Math.hypot(ux, uy) || 1;
+    let nx = -uy / len, ny = ux / len;
+    if ((b.hx - p.hx) * nx + (b.hy - p.hy) * ny > 0) { nx = -nx; ny = -ny; }
+    const tx = clamp(p.hx + ux * .85 + nx * 22, 12, W - 12), ty = clamp(Math.min(p.hy + uy * .85 + ny * 22, p.y + 12), 20, Math.min(floorOf(p), floorOf(b)) - 80);
+    aim(b, tx, ty);
+    // out of reach on this much string: let it run out first
+    b.pulling = Math.hypot(tx - b.x, ty - b.y) > 24 && Math.hypot(tx - b.hx, ty - b.hy) < b.L + 20;
+  } else if (b.mood === 'avoid') {
+    // high and well away from you, on its own side of the sky
+    const me = G.kites[0], side = b.hx > me.hx ? 1 : -1, tx = clamp(me.x + side * 150, 24, W - 24), ty = 26;
+    aim(b, tx, ty);
+    b.pulling = Math.hypot(tx - b.x, ty - b.y) > 30;
+  } else {
+    // just flying: give it string and let the wind have it, with a tug now and then to stay up
+    aim(b, b.x + G.wind, b.y - 80);
+    b.pulling = b.y > floorOf(b) - 100 || Math.random() < .06;
+  }
+}
+
+/* ---------- your little brother ---------- */
+// he holds the charkhi; when a cut kite drifts low over our terrace he drops it, runs to where the
+// kite is coming down and jumps for it. A kite he catches goes on our stash by the stair room
+const REACH = 2.05, BRO_SPEED = 4.2, STASH_AT = { x: MUMTY.x0 + 1.2, y: MUMTY.y1 + .7 };
+function newBrother() { return { x: HELPER.x, y: HELPER.y, yaw: 0, state: 'spool', walk: 0, t: 0, jump: 0, chase: null, kite: null }; }
+// where on our terrace he would have to stand to reach a kite at this point of the screen
+function reachFor(k) {
+  const me = G.kites[0];
+  if (k.y < me.hy - 80 || k.y > me.hy + 16 || k.vy < -6) return null;
+  const g = unproject(k.x, k.y + REACH * COS * S);
+  const pad = .55;
+  if (g.x < OURS.x0 + pad || g.x > OURS.x1 - pad || g.y < OURS.y0 + pad || g.y > OURS.y1 - pad) return null;
+  if (g.x > MUMTY.x0 - .4 && g.x < MUMTY.x1 + .4 && g.y > MUMTY.y0 - .4 && g.y < MUMTY.y1 + .4) return null;
+  return g;
+}
+function updateBrother(dt) {
+  const b = G.bro;
+  b.t += dt;
+  const walkTo = (x, y, speed) => {
+    const dx = x - b.x, dy = y - b.y, d = Math.hypot(dx, dy), step = speed * dt;
+    if (d > .01) b.yaw = Math.atan2(dy, dx);
+    b.walk += dt * speed * 3.4;
+    if (d <= step) { b.x = x; b.y = y; return true; }
+    b.x += dx / d * step; b.y += dy / d * step;
+    return false;
+  };
+  if (b.state === 'spool') {
+    b.yaw = Math.atan2(FLYERS[0].at.y - b.y, FLYERS[0].at.x - b.x);
+    const kite = [...G.loose, ...G.strays].find(k => !k.claimed && reachFor(k));
+    if (kite) { kite.claimed = true; b.chase = kite; b.state = 'run'; setStatus('a kite is coming down! your brother runs for it', 3); }
+    return;
+  }
+  if (b.state === 'run') {
+    const k = b.chase, alive = G.loose.includes(k) || G.strays.includes(k), g = alive && reachFor(k);
+    if (!g) { if (k) k.claimed = false; b.chase = null; b.jump = 0; b.state = 'back'; return; }
+    const close = walkTo(g.x, g.y, BRO_SPEED) || Math.hypot(g.x - b.x, g.y - b.y) < .6;
+    b.jump = close ? Math.abs(Math.sin(b.t * 7)) * .45 : 0;
+    const hand = project(b.x, b.y, REACH + b.jump);
+    if (Math.hypot(hand.sx - k.x, hand.sy - k.y) < 11) {
+      // caught it
+      G.loose = G.loose.filter(o => o !== k); G.strays = G.strays.filter(o => o !== k);
+      b.kite = { colors: k.colors, design: k.design || 'dhaal' }; b.chase = null; b.jump = 0; b.state = 'carry';
+      sound('loot', .6, panX(k.x));
+      setStatus('lootna! your brother grabbed a kite', 3);
+    }
+    return;
+  }
+  if (b.state === 'carry' && walkTo(STASH_AT.x, STASH_AT.y, 2.6)) {
+    G.stash.push(b.kite); G.lootTotal++; saveNumber('rooftop-patang-loot', G.lootTotal);
+    b.kite = null; b.state = 'back';
+    renderHud();
+  }
+  if (b.state === 'back' && walkTo(HELPER.x, HELPER.y, 2.6)) { b.state = 'spool'; b.walk = 0; }
+}
+
+/* ---------- state ---------- */
+const G = {
+  phase: 'play', time: 0, timer: 0, matchTime: 0, score: [0, 0], wind: 20, windTarget: 20, windT: 40, kites: [],
+  pechs: new Map(), loose: [], limp: [], sparks: [], relaunch: [0, 0, 0], holding: false, aimAt: null, keys: { left: false, right: false },
+  status: '', statusUntil: 0, dayT: 0, wins: readNumber('rooftop-patang-wins'), lootTotal: readNumber('rooftop-patang-loot'), stash: [], bro: newBrother(),
+  flutterT: 0, flock: 0, bursts: [], burstT: 2, windGrainT: 0,
+};
+function readNumber(key) { try { return +localStorage.getItem(key) || 0; } catch { return 0; } }
+function saveNumber(key, v) { try { localStorage.setItem(key, String(v)); } catch {} }
+const nodes = {
+  s: [document.getElementById('s0'), document.getElementById('s1')],
+  d: [document.getElementById('d0'), document.getElementById('d1')],
+  saw: [document.getElementById('saw0'), document.getElementById('saw1')],
+  pech: document.getElementById('pech'), wind: document.getElementById('wind'), mood: document.getElementById('mood'),
+  loot: document.getElementById('loot'), status: document.getElementById('status'),
+};
+for (const n of nodes.d) n.innerHTML = '<i></i>'.repeat(WIN);
+for (const n of nodes.saw) n.innerHTML = '<i></i>'.repeat(6);
+let hudKey = '';
+function renderHud() {
+  const me = G.kites[0], mine = me && pechOf(me);
+  const saws = mine ? (mine.a === me ? [mine.sawA, mine.sawB] : [mine.sawB, mine.sawA]).map(s => Math.min(6, Math.ceil(s / SAW * 6 - .001))) : [0, 0];
+  const hunter = G.kites.find(k => k && k.side && k.mood === 'hunt' && k.prey === 0 && flying(k));
+  const mood = hunter ? FLYERS[hunter.side].name + ' is after you' : G.kites[1] && G.kites[1].mood !== 'hunt' ? 'next door ' + MOODS[G.kites[1].mood] : 'neighbours';
+  const key = G.score.join() + '|' + saws.join() + '|' + !!mine + '|' + G.wind.toFixed(0) + '|' + mood + '|' + G.lootTotal + '|' + dayName();
+  if (key === hudKey) return;
+  hudKey = key;
+  for (let t = 0; t < 2; t++) {
+    nodes.s[t].textContent = G.score[t];
+    [...nodes.d[t].children].forEach((el, k) => el.classList.toggle('off', k >= G.score[t]));
+    [...nodes.saw[t].children].forEach((el, k) => el.classList.toggle('off', k >= saws[t]));
+  }
+  nodes.pech.hidden = !mine;
+  nodes.mood.textContent = mood;
+  nodes.loot.textContent = 'looted kites: ' + G.lootTotal;
+  const strength = Math.abs(G.wind) > 26 ? 'strong ' : Math.abs(G.wind) < 15 ? 'light ' : '';
+  nodes.wind.textContent = dayName() + ' · ' + strength + 'wind ' + (G.wind > 0 ? '→' : '←');
+}
+// a status line; with a time, it clears itself afterwards
+function setStatus(text, secs = 0) {
+  G.statusUntil = secs ? G.time + secs : 0;
+  if (text === G.status) return;
+  G.status = text;
+  nodes.status.textContent = text;
+}
+const HINT = 'hold to pull towards your finger · let go to give it string';
+
+/* ---------- the day ---------- */
+const newWind = () => (Math.random() < .5 ? -1 : 1) * (12 + Math.random() * 22);
+function newMatch() {
+  G.score = [0, 0]; G.phase = 'play'; G.timer = 0; G.matchTime = 0;
+  // whoever has no kite up sends one up
+  // one at a time, so each new kite can see the others and pick a different design and colour
+  for (const side of [0, 1, 2]) if (!G.kites[side] || G.kites[side].state !== 'fly') G.kites[side] = launchKite(side);
+  setStatus(HINT, 6);
+  renderHud();
+}
+function cutKite(loser, at, how, by) {
+  if (loser.state !== 'fly') return;
+  loser.state = 'loose'; loser.pulling = false; loser.launching = false;
+  G.relaunch[loser.side] = 1.8;
+  if (at) {
+    G.limp.push({ side: loser.side, x: at.x, y: at.y, t: 0 });
+    loser.vx = G.wind; loser.vy = -10;
+    sound('snap', .6, panX(at.x));
+  }
+  G.loose.push(loser);
+  const scoring = G.phase === 'play';
+  if (loser.side === 0) {
+    if (scoring) G.score[1]++;
+    sound('lost', .6, panX(loser.x));
+    setStatus(how === 'dip' ? 'your kite went down among the roofs' : 'bo kata… ' + FLYERS[by.side].name + ' cut your kite', 4);
+  } else if (by && by.side === 0) {
+    if (scoring) G.score[0]++;
+    sound('cheer', .6, panX(loser.x));
+    setStatus('kai po che! you cut ' + FLYERS[loser.side].their + ' kite', 4);
+  } else if (by) {
+    sound('farcheer', .6, panX(loser.x));
+    setStatus(FLYERS[by.side].name + ' cut ' + FLYERS[loser.side].their + ' kite', 3);
+  }
+  if (scoring && (loser.side === 0 || (by && by.side === 0))) G.windTarget = newWind();
+  if (scoring && Math.max(...G.score) >= WIN) finishMatch();
+  renderHud();
+}
+function finishMatch() {
+  G.phase = 'over'; G.timer = 0;
+  const won = G.score[0] > G.score[1];
+  if (won) { G.wins++; saveNumber('rooftop-patang-wins', G.wins); }
+  sound(won ? 'win' : 'lose');
+  setStatus((won ? 'you rule the sky ' : 'the neighbours win ') + G.score[0] + '–' + G.score[1] + ' · days won ' + G.wins + ' · tap to fly again tomorrow');
+}
+// pechs: any two strings that cross start sawing at each other
+function sawRate(k) {
+  const speed = Math.hypot(k.vx, k.vy) / TOP_SPEED;
+  const rate = k.pulling ? .7 + speed * .8 : k.paying ? .35 + clamp(k.run / 45, 0, 1) * .9 : .15;
+  return rate * (k.side ? level().skill : 1);
+}
+function updatePechs(dt) {
+  for (const [key, p] of G.pechs) if (!fighting(p.a) || !fighting(p.b) || !G.kites.includes(p.a) || !G.kites.includes(p.b)) G.pechs.delete(key);
+  const up = G.kites.filter(fighting);
+  for (let i = 0; i < up.length; i++) for (let j = i + 1; j < up.length; j++) {
+    const a = up[i], b = up[j], key = a.side + '-' + b.side;
+    if (!fighting(a) || !fighting(b)) continue;
+    // sagging strings flicker in and out of touch, so a pech holds through short gaps
+    const x = crossing(stringPoints(a), stringPoints(b));
+    let p = G.pechs.get(key);
+    if (!x) { if (p && (p.lost += dt) > PECH_GRACE) G.pechs.delete(key); continue; }
+    if (!p) {
+      p = { a, b, x, lost: 0, sawA: 0, sawB: 0 };
+      G.pechs.set(key, p);
+      if (a.side === 0 || b.side === 0) { sound('pech', .6, panX(x.x)); if (!G.statusUntil) setStatus('pech! pull hard, or let it run', 2.5); }
+      else setStatus('next door and the back roof are in a pech!', 2.5);
+    }
+    p.x = x; p.lost = 0;
+    p.sawA += dt * sawRate(a); p.sawB += dt * sawRate(b);
+    if (Math.random() < dt * 30) G.sparks.push({ x: x.x + (Math.random() - .5) * 3, y: x.y + (Math.random() - .5) * 3, t: 0 });
+    if (p.sawA >= SAW || p.sawB >= SAW) {
+      G.pechs.delete(key);
+      if (p.sawA >= p.sawB) cutKite(b, x, 'cut', a); else cutKite(a, x, 'cut', b);
+    }
+  }
+}
+
+/* ---------- loop ---------- */
+const panX = x => clamp((x - W / 2) / (W / 2), -1, 1) * .8;
+function update(dt) {
+  G.time += dt; G.timer += dt;
+  if (G.phase === 'play') G.matchTime += dt;
+  if (G.statusUntil && G.time > G.statusUntil) setStatus('');
+  // the wind drifts round to a new strength and direction now and then
+  if ((G.windT -= dt) <= 0) { G.windT = 35 + Math.random() * 30; G.windTarget = newWind(); }
+  G.wind = lerp(G.wind, G.windTarget, Math.min(1, dt * .35));
+  const me = G.kites[0];
+  // you can fly your kite the whole time; a launching kite flies itself
+  for (const k of G.kites) {
+    if (k.state !== 'fly') { k.pulling = false; continue; }
+    if (!k.launching && k.calm > 0) k.calm -= dt;
+    if (k.launching) {
+      k.pulling = true; k.steer = null;
+      if ((k.launchT += dt) > 2.6 || k.y < k.hy - 120) k.launching = false;
+    } else if (k === me) {
+      me.pulling = G.holding;
+      me.steer = G.aimAt ? null : G.keys.right - G.keys.left;
+      if (G.aimAt) aim(me, G.aimAt.x, G.aimAt.y);
+    } else botThink(k, dt);
+  }
+  for (let s = 0; s < 3; s++) for (const k of G.kites) stepKite(k, dt / 3);
+  for (const k of G.loose) if (!G.kites.includes(k)) stepKite(k, dt);
+  // whoever lost a kite sends a new one up
+  G.kites.forEach((k, side) => { if (k.state !== 'fly' && (G.relaunch[side] -= dt) <= 0) G.kites[side] = launchKite(side); });
+  for (const k of G.kites) if (flying(k) && k.y > floorOf(k)) cutKite(k, null, 'dip', null);
+  updatePechs(dt);
+  updateBrother(dt);
+  G.limp = G.limp.filter(l => (l.t += dt) < 1.6);
+  G.sparks = G.sparks.filter(s => (s.t += dt) < .25);
+  G.loose = G.loose.filter(k => k.x > -30 && k.x < W + 30 && k.y < H + 30);
+  G.dayT += dt;
+  G.flock += dt;
+  updateSky(dt);
+  updateNight(dt);
+  updateAudio(dt);
+  renderHud();
+}
+
+/* ---------- drawing ---------- */
+function cloth(a, b, zTop, len, color, phase) {
+  // a piece of washing hanging off the line, its hem lifting on the wind
+  const wx = G.wind / 40, c0 = rgb(...color), c1 = rampOf(color)[2];
+  for (let t = 0; t <= 1; t += .07) {
+    const bx = lerp(a[0], b[0], t), by = lerp(a[1], b[1], t);
+    const sway = STILL ? .1 : (Math.sin(G.time * 3.2 + t * 4 + phase) * .25 + .55) * wx;
+    for (let s = 0; s <= len; s += .045) {
+      const lift = sway * s;
+      plot(bx + lift * .7, by - lift * .7, zTop - s * (1 - Math.abs(sway) * .25), (t * 14 | 0) % 3 ? c0 : c1);
+    }
+  }
+  for (let t = .2; t < 1; t += .3) castShadow(lerp(a[0], b[0], t), lerp(a[1], b[1], t), zTop - len / 2, .25);
+}
+function drawWashing() {
+  const n = CLOTHES.length;
+  for (let k = 0; k < n; k++) {
+    const t0 = .08 + k / n * .9, t1 = t0 + .17;
+    const a = [lerp(LINE_A[0], LINE_B[0], t0), lerp(LINE_A[1], LINE_B[1], t0)], b = [lerp(LINE_A[0], LINE_B[0], t1), lerp(LINE_A[1], LINE_B[1], t1)];
+    cloth(a, b, LINE_Z, k % 2 ? .55 : .8, CLOTHES[k], k * 1.7);
+  }
+  const p = project(...LINE_A, LINE_Z), q = project(...LINE_B, LINE_Z), pts = [];
+  for (let t = 0; t <= 1; t += .02) pts.push([lerp(p.sx, q.sx, t), lerp(p.sy, q.sy, t) + Math.sin(t * Math.PI) * 1.5]);
+  drawDots(pts, rgb(80, 76, 70));
+}
+// the kites the brother has looted, leaning on the stair room and then along our parapet
+function drawStash() {
+  G.stash.slice(-8).forEach((k, j) => {
+    if (j < 4) leanKite(MUMTY.x0 + .35 + j * .58, MUMTY.y1, 0, k.colors[0], k.colors[1], 'y');
+    else leanKite(OURS.x0 + .25, 3.4 + (j - 4) * .58, 0, k.colors[0], k.colors[1], 'x');
+  });
+}
+function facing(f, k) {
+  const h = project(f.at.x, f.at.y, f.base + 2.2), s = clamp((k.x - h.sx) / 90, -1.6, 1.6);
+  return Math.atan2(-1 - s, -1 + s);
+}
+function flyerPose(k, scale) {
+  const pull = k.pulling ? Math.sin(G.time * 16) * .45 : 0, sway = Math.sin(G.time * 1.6) * .05;
+  if (k.state !== 'fly') return { scale, armR: .3, armL: .2, stance: .15, lean: -.05 };
+  // letting string run: one arm up, the other easing it out
+  if (k.paying) return { scale, armR: 2.35 + sway, armL: 1.3 + Math.sin(G.time * 9) * .15, stance: .2, lean: -.08 };
+  return { scale, armR: 2.2 + pull + sway, armL: 1.95 - pull, stance: .24, lean: k.pulling ? .12 : -.04, crouch: k.pulling ? .12 : 0 };
+}
+function drawFlyer(side) {
+  const f = FLYERS[side], k = G.kites[side];
+  const hand = figure(f.at.x, f.at.y, facing(f, k), { ...flyerPose(k, f.scale), z: f.base }, f.look, dynamicAdd);
+  const p = project(...hand);
+  k.hx = p.sx; k.hy = p.sy;
+}
+// the charkhi: in his hands, or on the floor where he dropped it
+function drawSpool(x, y, z, yaw) {
+  const sx = -Math.sin(yaw) * .17, sy = Math.cos(yaw) * .17;
+  for (let t = 0; t <= 1; t += .1) {
+    const end = t < .22 || t > .78;
+    sphere(x + sx * (t * 2 - 1), y + sy * (t * 2 - 1), z, end ? .15 : .12, end ? [150, 100, 60] : [214, 70, 120], 'solid');
+  }
+  pendingShadows.push([x, y, z], .15, [x, y, z], .15);
+  return project(x, y, z + .05);
+}
+function drawBrother() {
+  const b = G.bro, w = Math.sin(b.walk);
+  let pose;
+  if (b.state === 'spool') pose = { scale: .62, armR: 1.25, armL: 1.15, stance: .12 };
+  else if (b.state === 'run' && b.jump > 0) pose = { scale: .62, armR: 2.9, armL: 2.7, stance: .1, z: b.jump }; // jumping for it
+  else if (b.state === 'run') pose = { scale: .62, stance: w * .42, lean: .3, armR: -w * .8, armL: w * .8 };
+  else if (b.state === 'carry') pose = { scale: .62, stance: w * .3, lean: .1, armR: 2.5, armL: 2.4 };
+  else pose = { scale: .62, stance: w * .3, lean: .12, armR: -w * .5, armL: w * .5 };
+  const hand = figure(b.x, b.y, b.yaw, pose, KID, dynamicAdd);
+  if (b.state === 'spool') return drawSpool(hand[0], hand[1], hand[2] + .05, b.yaw);
+  if (b.kite) { const p = project(...hand); b.carryAt = [p.sx, p.sy - 4]; }
+  return drawSpool(HELPER.x, HELPER.y, .15, .6);
+}
+function drawPeople() {
+  pendingShadows.length = 0;
+  drawFlyer(0);
+  drawFlyer(2);
+  const spool = drawBrother();
+  flushShadows();
+  pendingShadows.length = 0;
+  shadowBase = RISE;
+  drawFlyer(1);
+  flushShadows();
+  pendingShadows.length = 0;
+  shadowBase = 0;
+  return spool;
+}
+function line(points, color) {
+  for (let j = 0; j < points.length - 1; j++) {
+    const [ax, ay] = points[j], [bx, by] = points[j + 1], n = Math.max(1, Math.ceil(Math.max(Math.abs(bx - ax), Math.abs(by - ay))));
+    for (let s = 0; s < n; s++) {
+      const x = Math.round(lerp(ax, bx, s / n)), y = Math.round(lerp(ay, by, s / n));
+      if (x >= 0 && y >= 0 && x < W && y < H) pix[y * W + x] = color;
+    }
+  }
+}
+// a patang: a paper diamond on a bamboo spine and bow, with a little paper tail hanging from its bottom
+// corner. The design decides how the two colours are laid on: dhaal splits it down the spine,
+// patta runs a band across, chaand-tara puts a crescent and a star on it, aankh an eye
+function kitePaper(design, a, b, size) {
+  if (design === 'patta') return Math.abs(a - size * .5) < 1.7 * size ? 1 : 0;
+  if (design === 'chaandtara') {
+    const moon = Math.hypot(a - 2.2 * size, b + .9 * size) < 1.9 * size && Math.hypot(a - 2.9 * size, b + .1 * size) > 1.6 * size;
+    return moon || Math.hypot(a - 2.4 * size, b - 2 * size) < .85 * size ? 1 : 0;
+  }
+  if (design === 'aankh') { const r = Math.hypot(a, b); return r < 1.1 * size ? 0 : r < 2.8 * size ? 1 : 0; }
+  return b < 0 ? 0 : 1;
+}
+function drawKite(x, y, nose, colors, size = 1, design = 'dhaal', buf = pix, bw = W, bh = H) {
+  const fx = Math.cos(nose), fy = Math.sin(nose), rx = -fy, ry = fx;
+  const front = 7 * size, back = 6 * size, half = 6 * size, waist = size;
+  const tail = Math.max(2.5, 4.5 * size), tailStart = -back + 1.2; // the tail starts just inside the corner, so they always join
+  const ink = rgb(40, 34, 30), r = Math.ceil(Math.max(front, back + tail) + 2);
+  for (let iy = Math.floor(y - r); iy <= y + r; iy++) for (let ix = Math.floor(x - r); ix <= x + r; ix++) {
+    if (ix < 0 || iy < 0 || ix >= bw || iy >= bh) continue;
+    const dx = ix + .5 - x, dy = iy + .5 - y, a = dx * fx + dy * fy, b = dx * rx + dy * ry;
+    const w = a >= waist && a <= front ? half * (front - a) / (front - waist)
+      : a < waist && a >= -back ? half * (a + back) / (back + waist) : -1;
+    if (Math.abs(b) <= w) {
+      const edge = Math.abs(b) > w - 1 || a > front - 1;
+      const spine = size >= .9 && (Math.abs(b) < .5 || Math.abs(a - waist) < .5);
+      buf[iy * bw + ix] = edge ? ink : spine ? BAMBOO : colors[kitePaper(design, a, b, size)];
+      continue;
+    }
+    if (a > tailStart || a < -back - tail) continue;
+    const tw = .5 + (tailStart - a) * .55;
+    if (Math.abs(b) > tw) continue;
+    const tailEdge = Math.abs(b) > tw - .9 || a < -back - tail + .9;
+    buf[iy * bw + ix] = tailEdge && size >= .9 ? ink : colors[0];
+  }
+}
+
+/* ---------- the rest of the sky ---------- */
+// streaks of wind, other people's kites (now and then one gets cut and sails off into the distance),
+// cut kites tumbling past with their strings trailing, and pigeons wheeling round
+const FAR = [[44, 30, .3], [300, 22, .9], [180, 16, .1], [70, 100, .6], [330, 90, .4]];
+const STRAYS = [...FAR_KITES, [rgb(236, 236, 228), rgb(230, 70, 60)], [rgb(80, 170, 70), rgb(250, 230, 120)], [rgb(250, 140, 170), rgb(250, 250, 240)]];
+const STREAK = rgb(204, 214, 228), FAR_STRING = rgb(200, 194, 186), STRAY_STRING = rgb(214, 160, 150);
+function newSky() {
+  G.streaks = Array.from({ length: 11 }, () => ({ x: Math.random() * W, y: 8 + Math.random() * 150, len: 3 + Math.random() * 7, pace: .7 + Math.random() * .7, ph: Math.random() * 6 }));
+  G.far = FAR.map(([x, y, ph], k) => ({ x, y, ph, colors: FAR_KITES[k], state: 'fly', size: .45, t: 0, spin: 0, vx: 0, vy: 0 }));
+  G.strays = []; G.strayT = 25 + Math.random() * 20;
+}
+function updateSky(dt) {
+  const wind = G.wind, dir = Math.sign(wind) || 1;
+  for (const s of G.streaks) {
+    s.x += wind * 2.4 * s.pace * dt;
+    s.y += Math.sin(G.time * 1.3 + s.ph) * 3 * dt;
+    if (s.x > W + 12 || s.x < -12) { s.x = dir > 0 ? -10 : W + 10; s.y = 8 + Math.random() * 150; s.len = 3 + Math.random() * 7; }
+  }
+  for (const f of G.far) {
+    f.t += dt;
+    if (f.state === 'fly' && f.t > 20 && Math.random() < dt / 150 && G.far.every(o => o.state === 'fly')) {
+      f.state = 'away'; f.t = 0; f.vx = wind * .7; f.vy = -3; f.spin = (Math.random() < .5 ? -1 : 1) * 1.6;
+    } else if (f.state === 'away') {
+      f.x += f.vx * dt; f.y += f.vy * dt; f.size -= dt * .045;
+      if (f.size < .16) { f.state = 'gone'; f.t = 0; }
+    } else if (f.state === 'gone' && f.t > 7) {
+      Object.assign(f, { state: 'fly', t: 0, size: .45, x: 20 + Math.random() * (W - 40), y: 12 + Math.random() * 90, colors: STRAYS[(Math.random() * STRAYS.length) | 0] });
+    }
+  }
+  if ((G.strayT -= dt) <= 0 && !G.strays.length) {
+    G.strayT = 50 + Math.random() * 40; // a rare sight: about one a minute, never two at once
+    G.strays.push({
+      x: dir > 0 ? -16 : W + 16, y: 18 + Math.random() * 110, vx: wind * (1.1 + Math.random() * .5), vy: 4 + Math.random() * 6,
+      nose: Math.random() * 6.28, spin: (Math.random() < .5 ? -1 : 1) * (1 + Math.random() * 1.5), size: .7 + Math.random() * .3,
+      colors: STRAYS[(Math.random() * STRAYS.length) | 0], tail: 22 + Math.random() * 16, t: 0,
+    });
+  }
+  G.strays = G.strays.filter(s => {
+    s.t += dt;
+    s.x += s.vx * dt; s.y += (s.vy + Math.sin(s.t * 1.7) * 6) * dt; s.nose += s.spin * dt;
+    return s.x > -30 && s.x < W + 30 && s.y < H;
+  });
+}
+function drawSkyLife() {
+  const dir = Math.sign(G.wind) || 1, night = nightness();
+  if (night < .7) for (const s of G.streaks) {
+    const pts = [], y = Math.round(s.y);
+    for (let k = 0; k < s.len; k++) pts.push([Math.round(s.x - dir * k), y]);
+    if (s.len > 7) pts.push([Math.round(s.x - dir * (s.len + 1)), y - 1], [Math.round(s.x - dir * (s.len + 2)), y - 1]);
+    drawDots(pts, STREAK);
+  }
+  for (const f of G.far) {
+    if (f.state === 'gone') continue;
+    const bx = f.x + (f.state === 'fly' ? Math.sin(G.time * .5 + f.ph * 6) * 3 : 0), by = f.y + Math.sin(G.time * .7 + f.ph * 9) * 2;
+    if (f.state === 'fly') {
+      const tail = [];
+      for (let s = 4; s < 34; s += 2) tail.push([bx - dir * s * .35, by + s]);
+      drawDots(tail, FAR_STRING);
+      drawKite(bx, by, -Math.PI / 2 + dir * .25 + Math.sin(G.time * .8 + f.ph * 5) * .3, f.colors, f.size);
+    } else {
+      drawDots([[bx - dir, by + 2], [bx - dir * 2, by + 4], [bx - dir * 2, by + 6]], FAR_STRING);
+      drawKite(bx, by, -Math.PI / 2 + f.t * f.spin, f.colors, f.size);
+    }
+  }
+  for (const s of G.strays) {
+    const tail = [];
+    for (let k = 2; k < s.tail; k++) tail.push([Math.round(s.x - dir * k * .45 + Math.sin(s.t * 3 + k * .25) * 2), Math.round(s.y + k * .8)]);
+    drawDots(tail, STRAY_STRING);
+    drawKite(s.x, s.y, s.nose, s.colors, s.size);
+  }
+  const cx = 150 + Math.sin(G.flock * .05) * 60, cy = 34, pigeon = [];
+  if (night < .6) {
+    for (let k = 0; k < 7; k++) {
+      const a = G.flock * .55 + k * .32, px = Math.round(cx + Math.cos(a) * 70), py = Math.round(cy + Math.sin(a) * 14 + Math.sin(k * 2.3) * 3);
+      if (Math.floor(G.time * 7 + k) % 2) pigeon.push([px - 1, py], [px + 1, py], [px, py + 1]);
+      else pigeon.push([px - 1, py], [px, py], [px + 1, py]);
+    }
+    drawDots(pigeon, rgb(112, 112, 124));
+  }
+}
+// a saffron flag on the bamboo pole, streaming out the way the wind blows and rippling with it
+function drawFlag() {
+  const p = project(FLAG.x, FLAG.y, FLAG.top), dir = Math.sign(G.wind) || 1, strength = clamp(Math.abs(G.wind) / 30, .4, 1.1);
+  const light = rgb(246, 150, 44), dark = rgb(214, 112, 30), len = 13;
+  for (let c = 1; c <= len; c++) {
+    const wave = STILL ? 0 : Math.sin(G.time * 9 * strength - c * .7) * Math.min(c, 4) * .35 * strength;
+    const tall = Math.max(1, Math.round(8 * (1 - c / (len + 2)))), droop = (1 - strength) * c * .4;
+    for (let r = 0; r < tall; r++) {
+      const x = Math.round(p.sx + dir * c), y = Math.round(p.sy + r + wave + droop);
+      if (x >= 0 && y >= 0 && x < W && y < H) pix[y * W + x] = r < tall / 2 ? light : dark;
+    }
+  }
+}
+// someone's kite, lost weeks ago, still caught in the neem: torn, faded, its string hanging through the leaves
+function drawTreeKite() {
+  const p = project(NEEM.x + .35, NEEM.y + .7, NEEM.z + 1.15), sway = STILL ? 0 : Math.round(Math.sin(G.time * 1.6) * Math.min(1, Math.abs(G.wind) / 25));
+  const kx = p.sx + sway, ky = p.sy;
+  drawKite(kx, ky, 2.45, [rgb(222, 112, 132), rgb(240, 232, 208)], 1.1);
+  drawDots([[kx - 6, ky - 1], [kx - 5, ky - 1], [kx - 6, ky], [kx - 5, ky - 2], [kx - 4, ky - 2]], rgb(52, 96, 52));
+  const string = [], dir = Math.sign(G.wind) || 1;
+  for (let s = 2; s < 34; s++) {
+    const swing = STILL ? 0 : Math.sin(G.time * 1.4 - s * .12) * Math.min(1, s / 10) * 1.5 * dir;
+    string.push([Math.round(kx + 1 + s * .18 + swing), Math.round(ky + 2 + s)]);
+  }
+  drawDots(string, rgb(196, 124, 140));
+}
+
+/* ---------- evening and night ---------- */
+// the day goes round on its own: a bright morning, then an evening of faded, darkening orange,
+// then night, when the windows light up, paper lanterns (tukkal) go up from roofs all round and
+// fireworks go off far away. Each lasts well over a minute, with a slow change between them
+const DAY_PART = 75, DAY_TURN = 12, DAY_NAMES = ['morning', 'evening', 'night'];
+function dayWeights() {
+  const span = DAY_PART + DAY_TURN, part = Math.floor(G.dayT / span) % 3, local = G.dayT % span;
+  const mix = local < DAY_PART ? 0 : ease((local - DAY_PART) / DAY_TURN), w = [0, 0, 0];
+  w[part] = 1 - mix; w[(part + 1) % 3] += mix;
+  return w;
+}
+const nightness = () => dayWeights()[2];
+const dayName = () => { const w = dayWeights(); return DAY_NAMES[w.indexOf(Math.max(...w))]; };
+const TUKKAL = [[34, 6, .3], [84, 5, 1.7], [292, 7, 2.6], [342, 4, .9]];
+const LAMP = [255, 202, 112];
+function updateNight(dt) {
+  const n = nightness();
+  if (n > .3 && (G.burstT -= dt) <= 0) {
+    G.burstT = (G.phase === 'over' ? .5 : 1.4) + Math.random() * 2.6;
+    const x = 24 + Math.random() * (W - 48), y = 18 + Math.random() * 90;
+    const hues = [[255, 90, 90], [255, 210, 80], [120, 220, 255], [190, 120, 255], [130, 255, 140], [255, 160, 220]];
+    const c1 = hues[(Math.random() * hues.length) | 0], c2 = hues[(Math.random() * hues.length) | 0];
+    for (let k = 0; k < 26; k++) {
+      const a = k / 26 * 6.283 + Math.random() * .2, sp = 18 + Math.random() * 26;
+      G.bursts.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, t: 0, life: 1 + Math.random() * .8, c: rgb(...(k % 2 ? c1 : c2)) });
+    }
+    sound('boom', .6, panX(x));
+  }
+  G.bursts = G.bursts.filter(p => {
+    p.t += dt; p.vy += 16 * dt; p.vx *= 1 - dt; p.vy *= 1 - dt * .6;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    return p.t < p.life;
+  });
+}
+function drawNight() {
+  const [, e, night] = dayWeights(), n = Math.max(night, e * .55); // the first tukkal go up at sunset
+  if (n < .05) return;
+  // tukkal: a string of glowing paper lanterns rising from somewhere below
+  const show = clamp((n - .1) / .5, 0, 1), dir = Math.sign(G.wind) || 1;
+  for (const [x0, count, ph] of TUKKAL) {
+    const lit = Math.round(count * show);
+    const at = j => {
+      const t = (j + 1) / count;
+      return [Math.round(x0 + dir * t * 22 + Math.sin(G.time * .9 + ph + j * .5) * 2), Math.round(150 - t * 95 + Math.sin(G.time * 1.3 + ph * 2 + j) * 1.5)];
+    };
+    // the string they hang from, rising out of sight below
+    if (lit) {
+      const pts = [[x0, 158]];
+      for (let j = 0; j < lit; j++) pts.push(at(j));
+      line(pts, rgb(84, 70, 92));
+    }
+    for (let j = 0; j < lit; j++) {
+      const [x, y] = at(j);
+      const flicker = Math.sin(G.time * 11 + j * 3 + ph) > .85 ? 1 : 0;
+      drawDots([[x - 1, y], [x + 1, y], [x - 1, y + 1], [x + 1, y + 1], [x, y - 1], [x, y + 2]], rgb(196, 92, 48));
+      drawDots([[x, y], [x, y + 1]], rgb(255, 226 - flicker * 30, 140));
+    }
+  }
+  // fireworks, far off
+  for (const p of G.bursts) {
+    const fade = 1 - p.t / p.life;
+    if (fade < .25 && Math.floor(p.t * 20) % 2) continue;
+    drawDots([[Math.round(p.x), Math.round(p.y)]], p.c);
+    if (p.t < .5) drawDots([[Math.round(p.x - p.vx * .04), Math.round(p.y - p.vy * .04)]], p.c);
+  }
+}
+// the sky is a gradient on the page behind the canvas, top to horizon: plain white in the morning;
+// at sunset deep indigo overhead, mauve, then an orange glow low down where the sun has gone; at night navy
+const SKIES = [
+  [[255, 255, 255], [255, 255, 255], [255, 255, 255]],
+  [[52, 50, 98], [146, 98, 128], [238, 146, 92]],
+  [[16, 20, 46], [26, 30, 62], [44, 44, 80]],
+];
+let skyCss = '';
+function grade() {
+  const [m, e, n] = dayWeights();
+  const stop = s => 'rgb(' + [0, 1, 2].map(c => (m * SKIES[0][s][c] + e * SKIES[1][s][c] + n * SKIES[2][s][c]) | 0).join(',') + ')';
+  const css = 'linear-gradient(to bottom, ' + stop(0) + ', ' + stop(1) + ' 62%, ' + stop(2) + ')';
+  if (css !== skyCss) {
+    skyCss = css;
+    document.documentElement.style.background = css;
+    document.body.style.background = 'transparent';
+    document.body.classList.toggle('night', e + n > .5);
+  }
+  if (m > .996) return;
+  for (let i = 0; i < pix.length; i++) {
+    const c = pix[i];
+    if (c === WHITE) { pix[i] = 0; continue; } // see-through, so the page's sky shows
+    const r = c & 255, g = c >> 8 & 255, b = c >> 16 & 255;
+    // sunset: the houses go dim and dusky, a little mauve in the shadows, warm left in the reds;
+    // night: dimmer still, and blue
+    pix[i] = rgb(
+      m * r + e * (r * .7 + 14) + n * (r * .38 + 12),
+      m * g + e * (g * .56 + 8) + n * (g * .4 + 12),
+      m * b + e * (b * .6 + 24) + n * (b * .58 + 34));
+  }
+  // lights coming on in the windows, a good few at sunset and most of them at night
+  const glow = Math.max(n, e * .75);
+  if (glow > .05) {
+    const lamp = rgb(lerp(60, LAMP[0], glow), lerp(48, LAMP[1], glow), lerp(48, LAMP[2], glow));
+    lamps.forEach((i, j) => { if (zb[i] === bakedZ[i] && (n > .5 || j % 2 === 0)) pix[i] = lamp; });
+  }
+}
+function draw() {
+  pix.set(bakedPix);
+  zb.set(bakedZ);
+  const windT = STILL ? 0 : Math.floor(G.time * WIND_FPS) / WIND_FPS;
+  drawWashing();
+  drawStash();
+  const spool = drawPeople();
+  drawLeaves(windT);
+  applyShadows(bakedZ);
+  shadeEdges();
+  drawSkyLife();
+  drawTreeKite();
+  drawFlag();
+  const me = G.kites[0];
+  line([[spool.sx, spool.sy], [me.hx, me.hy]], MANJA[0]);
+  G.kites.forEach((k, side) => { if (k.state === 'fly') line(stringPoints(k), MANJA[side]); });
+  // a cut string falls away from the flyer's hand
+  for (const l of G.limp) {
+    const k = G.kites[l.side], fall = 30 * l.t + l.t * l.t * 90;
+    const end = [l.x + G.wind * l.t * 1.5, Math.min(k.hy + 20, l.y + fall)];
+    const mid = [(k.hx + end[0]) / 2 + Math.sin(l.t * 9) * 6, Math.max(k.hy, end[1]) + 14 + l.t * 20];
+    const pts = [];
+    for (let t = 0; t <= 1; t += .05) {
+      const u = 1 - t;
+      pts.push([u * u * k.hx + 2 * u * t * mid[0] + t * t * end[0], u * u * k.hy + 2 * u * t * mid[1] + t * t * end[1]]);
+    }
+    line(pts, MANJA[l.side]);
+  }
+  for (const k of G.loose) {
+    line([[k.x, k.y], [k.x - Math.cos(k.nose) * 4, k.y + 14]], MANJA[k.side]);
+    drawKite(k.x, k.y, k.nose, k.colors, kiteSize(k), k.design);
+  }
+  for (const k of G.kites) if (k.state === 'fly') drawKite(k.x, k.y, k.nose, k.colors, kiteSize(k), k.design);
+  if (G.bro.kite && G.bro.carryAt) drawKite(G.bro.carryAt[0], G.bro.carryAt[1], -Math.PI / 2, G.bro.kite.colors, .75, G.bro.kite.design);
+  const sparks = G.sparks.map(s => [Math.round(s.x), Math.round(s.y)]);
+  if (sparks.length) { haloDots(sparks); drawDots(sparks, SIGNAL); }
+  // warn when your kite sinks towards the roofs
+  if (flying(me) && me.y > floorOf(me) - 28 && Math.floor(G.time * 6) % 2) drawArrow(me.x, me.y - 10, G.time);
+  grade();
+  drawNight();
+  ctx.putImageData(image, 0, 0);
+}
+
+/* ---------- input ---------- */
+// hold anywhere: the kite turns towards that point and flies there. Let go to give it string
+function toCanvas(e) {
+  const r = canvas.getBoundingClientRect();
+  return { x: (e.clientX - r.left) * W / r.width, y: (e.clientY - r.top) * H / r.height };
+}
+function press() {
+  ensureAudio();
+  if (G.phase === 'over' && G.timer > 1.5) { newMatch(); return; }
+  G.holding = true;
+}
+function letGo() { G.holding = false; }
+canvas.addEventListener('pointerdown', e => {
+  canvas.focus({ preventScroll: true });
+  canvas.setPointerCapture(e.pointerId);
+  G.aimAt = toCanvas(e);
+  press();
+});
+canvas.addEventListener('pointermove', e => { if (G.holding && G.aimAt) G.aimAt = toCanvas(e); });
+canvas.addEventListener('pointerup', letGo);
+canvas.addEventListener('pointercancel', letGo);
+const KEYS = { ArrowLeft: 'left', ArrowRight: 'right', a: 'left', d: 'right' };
+canvas.addEventListener('keydown', e => {
+  if (KEYS[e.key]) { G.keys[KEYS[e.key]] = true; G.aimAt = null; e.preventDefault(); return; }
+  if (e.key !== ' ' && e.key !== 'Enter') return;
+  e.preventDefault();
+  G.aimAt = null;
+  if (!e.repeat) press();
+});
+canvas.addEventListener('keyup', e => {
+  if (KEYS[e.key]) G.keys[KEYS[e.key]] = false;
+  if (e.key === ' ' || e.key === 'Enter') letGo();
+});
+addEventListener('blur', () => { letGo(); G.keys.left = G.keys.right = false; });
+
+/* ---------- sound ---------- */
+// recordings from rooftop-patang/sounds/ when they are there, synthesised sounds when they are not;
+// everything is panned to where it happens
+let audio = null, master = null, hissBuffer = null, muted = false, rasp = null, windBed = null;
+const SAMPLES = {
+  cheer: 'sounds/freesound_community-crowd-cheering-6229.mp3',
+  wind: 'sounds/storegraphic-soft-wind-477404.mp3',
+  fireworks: 'sounds/freesound_community-distant-firework-barrage-aerial-cake-35808.mp3',
+  kaipoche: 'sounds/kaipoche.mp3', whistle: 'sounds/whistle.mp3', // not added yet: these two stay synthesised
+};
+const SAMPLE_VOL = { cheer: 1.4, kaipoche: .8, whistle: .4, wind: .5, fireworks: .45 };
+const samples = {};
+function ensureAudio() {
+  if (audio) { if (audio.state === 'suspended') audio.resume(); return; }
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return;
+  audio = new AC();
+  master = audio.createGain();
+  master.gain.value = muted ? 0 : 1;
+  master.connect(audio.destination);
+  hissBuffer = audio.createBuffer(1, audio.sampleRate * 2, audio.sampleRate);
+  const data = hissBuffer.getChannelData(0);
+  for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+  startBeds();
+  loadSamples();
+}
+function loadSamples() {
+  for (const [name, file] of Object.entries(SAMPLES)) {
+    fetch(file).then(r => { if (!r.ok) throw new Error(file); return r.arrayBuffer(); }).then(b => audio.decodeAudioData(b)).then(buf => {
+      samples[name] = buf;
+      if (name === 'wind') windBed.gain.gain.value = .015; // the recording carries the wind now; the hiss just fills the gaps
+    }).catch(() => {}); // a missing file just means the synthesised version plays
+  }
+}
+// play part of a recording through the current bus; false if it has not loaded, so the caller can synthesise instead
+function play(name, { offset = 0, dur = 0, vol = 1, rate = 1, when = 0, fadeIn = 0 } = {}) {
+  const buf = samples[name];
+  if (!buf) return false;
+  const t = audio.currentTime + when, src = audio.createBufferSource(), g = audio.createGain();
+  src.buffer = buf; src.playbackRate.value = rate;
+  const level = vol * SAMPLE_VOL[name], length = (dur || buf.duration - offset) / rate;
+  g.gain.setValueAtTime(fadeIn ? 0 : level, t);
+  if (fadeIn) g.gain.linearRampToValueAtTime(level, t + fadeIn);
+  g.gain.setValueAtTime(level, t + Math.max(0, length - .08));
+  g.gain.linearRampToValueAtTime(0, t + length);
+  src.connect(g).connect(bus);
+  src.start(t, offset, dur || undefined);
+  return true;
+}
+const buses = new Map();
+let bus = null;
+function busFor(pan, far = 0) {
+  const step = Math.round(clamp(pan, -1, 1) * 5), key = step + '|' + far;
+  let node = buses.get(key);
+  if (node) return node;
+  node = audio.createGain();
+  let tail = node;
+  if (far) {
+    const lp = audio.createBiquadFilter();
+    lp.type = 'lowpass'; lp.frequency.value = far > 1 ? 900 : 1800;
+    node.gain.value = far > 1 ? .55 : .8;
+    tail.connect(lp); tail = lp;
+  }
+  if (audio.createStereoPanner) { const p = audio.createStereoPanner(); p.pan.value = step / 5; tail.connect(p); tail = p; }
+  tail.connect(master);
+  buses.set(key, node);
+  return node;
+}
+function tone(f0, f1, dur, vol, type = 'sine', when = 0) {
+  const now = audio.currentTime + when, osc = audio.createOscillator(), g = audio.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(f0, now);
+  osc.frequency.exponentialRampToValueAtTime(f1, now + dur);
+  g.gain.setValueAtTime(.0001, now);
+  g.gain.linearRampToValueAtTime(vol, now + Math.min(.015, dur * .3));
+  g.gain.exponentialRampToValueAtTime(.0005, now + dur);
+  osc.connect(g).connect(bus);
+  osc.start(now); osc.stop(now + dur + .02);
+}
+function hiss(dur, vol, freq, q = 1, type = 'bandpass', when = 0, attack = .03) {
+  const now = audio.currentTime + when, src = audio.createBufferSource(), f = audio.createBiquadFilter(), g = audio.createGain();
+  src.buffer = hissBuffer;
+  f.type = type; f.frequency.value = freq; f.Q.value = q;
+  g.gain.setValueAtTime(.0001, now);
+  g.gain.linearRampToValueAtTime(vol, now + Math.min(attack, dur * .4));
+  g.gain.exponentialRampToValueAtTime(.0005, now + dur);
+  src.connect(f).connect(g).connect(bus);
+  src.start(now, Math.random()); src.stop(now + dur + .02);
+}
+function loopNoise(freq, q, type, vol) {
+  const src = audio.createBufferSource(), f = audio.createBiquadFilter(), g = audio.createGain();
+  src.buffer = hissBuffer; src.loop = true;
+  f.type = type; f.frequency.value = freq; f.Q.value = q;
+  g.gain.value = vol;
+  src.connect(f).connect(g).connect(master);
+  src.start();
+  return { gain: g, filter: f };
+}
+function startBeds() {
+  // wind over the rooftops, and the grinding of two strings, silent until they cross
+  windBed = loopNoise(420, .7, 'lowpass', .03);
+  const lfo = audio.createOscillator(), depth = audio.createGain();
+  lfo.frequency.value = .08; depth.gain.value = .018;
+  lfo.connect(depth).connect(windBed.gain.gain); lfo.start();
+  rasp = loopNoise(3400, 3, 'bandpass', 0);
+}
+function updateAudio(dt) {
+  if (!audio) return;
+  const now = audio.currentTime, me = G.kites[0];
+  windBed.filter.frequency.setTargetAtTime(300 + Math.abs(G.wind) * 9, now, .5);
+  // the wind recording has one gust and then dies away, so overlapping slices of it, each faded in
+  // and out, make a breeze that never stops, louder when the wind is strong
+  if (samples.wind && (G.windGrainT -= dt) <= 0) {
+    G.windGrainT = 2.6 + Math.random() * 1.4;
+    bus = busFor((Math.random() - .5) * .8);
+    play('wind', { offset: .3 + Math.random() * 3, dur: 4.4, fadeIn: 1.4, vol: clamp(Math.abs(G.wind) / 26, .45, 1.3) });
+  }
+  let busy = 0;
+  for (const p of G.pechs.values()) busy += (p.a.pulling || p.a.paying) + (p.b.pulling || p.b.paying);
+  rasp.gain.gain.setTargetAtTime(G.pechs.size ? .025 + .03 * Math.min(busy, 2) : 0, now, .05);
+  // the paper rattles while you pull
+  G.flutterT -= dt;
+  if (me.pulling && me.state === 'fly' && G.flutterT <= 0) {
+    G.flutterT = .07 + Math.random() * .05;
+    bus = busFor(panX(me.x));
+    hiss(.05, .018, 1500 + Math.random() * 700, 2.5, 'bandpass', 0, .005);
+  }
+}
+function sound(kind, amount = .6, pan = 0) {
+  if (!audio) return;
+  bus = busFor(pan);
+  if (kind === 'pech') { hiss(.18, .05, 3000, 2); tone(1400, 1100, .05, .03, 'square'); }
+  else if (kind === 'snap') { tone(2400, 700, .06, .12, 'square'); hiss(.08, .08, 4000, 1.5, 'bandpass', 0, .003); }
+  else if (kind === 'cheer') {
+    // the roofs around erupt: "kai po che!", a crowd swell, whistles and a pipudi toot
+    bus = busFor(pan * .5);
+    play('kaipoche');
+    bus = busFor(pan, 1);
+    if (!play('cheer', { offset: .6, dur: 3.4, fadeIn: .15 })) hiss(1.6, .09, 1000, .6, 'bandpass', 0, .3);
+    if (!play('whistle', { when: .4, dur: 2 })) for (let k = 0; k < 3; k++) tone(1900 + k * 160, 2500, .22, .035, 'sine', .15 + k * .2);
+    bus = busFor(-pan * .5);
+    tone(520, 540, .45, .05, 'sawtooth', .3); tone(530, 470, .35, .05, 'sawtooth', .8);
+  }
+  else if (kind === 'farcheer') {
+    bus = busFor(pan, 2);
+    if (!play('cheer', { offset: 1.4, dur: 2.6, vol: .5, rate: .95, fadeIn: .3 })) hiss(1.2, .05, 900, .6, 'bandpass', 0, .3);
+  }
+  else if (kind === 'lost') { tone(330, 190, .6, .07, 'sawtooth'); hiss(.6, .03, 600, 1, 'lowpass'); }
+  else if (kind === 'loot') { tone(660, 990, .1, .07, 'triangle'); tone(990, 1320, .14, .06, 'triangle', .09); tone(880, 1760, .25, .04, 'sine', .2); }
+  else if (kind === 'boom') {
+    bus = busFor(pan, 2);
+    const fw = samples.fireworks;
+    if (!fw || !play('fireworks', { offset: 2 + Math.random() * Math.max(0, fw.duration - 5), dur: 1.8, vol: .7, fadeIn: .05 })) {
+      tone(90, 40, .5, .12); hiss(.6, .04, 2500, .8, 'bandpass', .12);
+    }
+  }
+  else if (kind === 'win') [523, 659, 784, 1046].forEach((f, k) => tone(f, f * 1.002, .32, .07, 'triangle', k * .13));
+  else if (kind === 'lose') [392, 330, 262].forEach((f, k) => tone(f, f * .98, .4, .06, 'triangle', k * .18));
+}
+const muteButton = document.getElementById('mute');
+muteButton.addEventListener('click', () => {
+  muted = !muted;
+  if (master) master.gain.value = muted ? 0 : 1;
+  muteButton.textContent = muted ? 'sound off' : 'sound on';
+  muteButton.setAttribute('aria-pressed', String(muted));
+});
+document.addEventListener('visibilitychange', () => {
+  if (!audio) return;
+  if (document.hidden) audio.suspend(); else audio.resume();
+});
+
+/* ---------- boot ---------- */
+addEventListener('resize', fit);
+fit();
+bake();
+newSky();
+G.windTarget = G.wind = newWind();
+newMatch();
+let last = performance.now();
+function frame(now) {
+  update(Math.min(.04, (now - last) / 1000));
+  last = now;
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+window.__patang = { G, newMatch, step(dt, skipDraw) { update(dt); if (!skipDraw) draw(); } };
+</script>
+</body>
+</html>

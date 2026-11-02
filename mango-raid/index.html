@@ -1,0 +1,1618 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Mango Raid</title>
+<style>
+  :root { --ink: #1c1b19; --muted: #8b877f; --paper: #fff; --ripe: #d98a1c; --noise: #b5392b; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; background: var(--paper); color: var(--ink); }
+  body { font: 13px/1.35 ui-monospace, "Cascadia Mono", Consolas, Menlo, monospace; overflow: hidden; }
+  #stage { position: fixed; inset: 0; display: grid; place-items: center; }
+  canvas { display: block; image-rendering: pixelated; touch-action: none; cursor: grab; outline: none; }
+  canvas:active { cursor: grabbing; }
+  #top { position: fixed; top: max(14px, env(safe-area-inset-top)); left: max(16px, env(safe-area-inset-left)); display: grid; gap: 4px; pointer-events: none; }
+  .row { display: flex; align-items: center; gap: 8px; }
+  .row b { font-size: 16px; font-weight: 600; min-width: 2ch; font-variant-numeric: tabular-nums; color: var(--ripe); }
+  .label { color: var(--muted); }
+  .cells { display: flex; gap: 3px; }
+  .cells i { width: 6px; height: 6px; background: currentColor; }
+  .cells i.off { opacity: .16; }
+  #stones { color: #6f6a62; }
+  #noise { color: var(--noise); }
+  #dogm { color: #9a6a3a; }
+  .hud { position: fixed; left: max(16px, env(safe-area-inset-left)); right: max(16px, env(safe-area-inset-right)); display: flex; justify-content: space-between; gap: 16px; pointer-events: none; }
+  #bottom { bottom: max(14px, env(safe-area-inset-bottom)); align-items: flex-end; }
+  #status { color: var(--muted); }
+  button { pointer-events: auto; font: inherit; color: var(--muted); background: none; border: 0; padding: 10px; margin: -10px; cursor: pointer; }
+  button:hover, button:focus-visible { color: var(--ink); }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="c" tabindex="0" aria-label="A mango tree in a walled yard, its owner asleep on a charpai. Drag back and release to throw a stone, or use arrow keys and space."></canvas></div>
+<div id="top">
+  <div class="row"><b id="score">0</b><span class="label">points</span></div>
+  <div class="row"><span class="cells" id="stones"></span><span class="label">stones</span></div>
+  <div class="row"><span class="cells" id="noise"></span><span class="label" id="noise-label">uncle asleep</span></div>
+  <div class="row"><span class="cells" id="dogm"></span><span class="label" id="dog-label">dog asleep</span></div>
+</div>
+<div class="hud" id="bottom">
+  <div id="status" role="status" aria-live="polite"></div>
+  <button id="mute" type="button" aria-pressed="false">sound on</button>
+</div>
+<script src="../shell.js"></script>
+<script>
+PixelPlays.mount({
+  id: 'mango-raid',
+  rules: [
+    'Uncle is napping under his mango tree. Knock down as many mangoes as you can before your stones run out.',
+    'Drag back and release to throw. A longer pull throws harder and higher. Keyboard: left and right to aim, up and down for power, space to throw.',
+    'Ripe yellow mangoes are worth 3, raw green ones 1. Your little sister collects whatever falls.',
+    'Every noise counts: the trunk, the wall, anything near the charpai. If the noise bar fills, uncle wakes up and you run with whatever is in the basket.',
+    'Mind the crow on the wall. Startle it and it flies off cawing, and uncle hears that too.',
+    'A dog sleeps under the tree. Anything landing near it makes it lift its head and listen; do it again before it settles and it wakes up and chases you out.',
+  ],
+});
+</script>
+<script>window.PP_SCENE = { originY: 22, shadowX: .8, shadowY: -.5 };</script>
+<script src="../engine.js"></script>
+<script>
+'use strict';
+
+/* ---------- layout ---------- */
+// x runs screen down-right, y runs screen down-left, z is up. The yard's back corner is at the top of the screen.
+const TRUNK = { x: -3.6, y: -3.4 };
+const CANOPY = { x: -3.4, y: -3.3, z: 5.4, rx: 3.8, ry: 3.8, rz: 2.3 };
+const WALL = -9.2, WALL_H = 1.15, WALL_T = .45;
+const COT = { x0: -.5, y0: -6.7, x1: 1.9, y1: -5.5, z: .58 };
+const COT_Y = (COT.y0 + COT.y1) / 2;
+const PUMP = { x: 5.6, y: 2.4 };
+const PLAYER = { x: -5.4, y: 6.2 };
+const BASKET = { x: -3.3, y: 7.5 };
+const HOME = { x: -2.3, y: 6.9 };
+const EXIT = { x: -9, y: 16 };
+const DOG = { x: -6.6, y: -1.4, yaw: Math.PI * .75 }; // asleep in the tree's shade, side-on to the camera
+
+const STONES = 15, MANGO_COUNT = 16, STALK = .42;
+const GRAVITY = 12, ELEVATION = .88, MAX_SPEED = 15, RELEASE_Z = 2.1;
+const MANGO_R = .3, HIT_R = .45, STONE_R = .12;
+const NOISE_DECAY = .028, STIR_AT = .6;
+const ROOST = 8; // birds living in the mango tree
+
+/* ---------- palette ---------- */
+const EARTH = [172, 128, 90];
+const EARTH_TONES = [[160, 118, 84], [168, 125, 89], [176, 133, 95], [184, 141, 101]];
+const PATH_TONES = [[190, 154, 112], [198, 162, 119], [206, 170, 126]];
+const DRY_GRASS = [[128, 132, 64], [146, 146, 72], [164, 158, 84]];
+const MUD = [[92, 72, 60], [104, 82, 66], [116, 92, 72]];
+const DRY_LEAF = [[196, 150, 68], [150, 102, 58], [176, 120, 60]];
+const PLASTER = [196, 160, 120], PLASTER_B = [186, 150, 112], CAP = [150, 112, 84], BRICK = [168, 84, 60];
+const WOOD = [128, 86, 52], WOOD_DARK = [92, 62, 42], ROPE = [214, 190, 142], ROPE_GAP = [120, 90, 62];
+const MANGO_BARK = [88, 76, 68];
+const LEAF = [[20, 48, 34], [30, 64, 40], [44, 86, 48], [70, 114, 56], [114, 146, 66]];
+const LEAF_FLUSH = [138, 140, 64]; // a few tips of pale new growth
+const RIPE_TOP = [232, 116, 40], RIPE = [248, 186, 40], RIPE_LOW = [252, 212, 76];
+const RAW_TOP = [92, 140, 52], RAW = [128, 170, 64];
+const STALK_C = rgb(72, 70, 40);
+const STONE_C = [150, 144, 136];
+const CANE = [196, 156, 92], CANE_DARK = [164, 124, 70], CANE_RIM = [212, 176, 110], BASKET_FLOOR = rgb(96, 70, 44);
+const VEST = [236, 232, 220], LUNGI = [58, 104, 136], LUNGI_B = [214, 210, 194];
+const PUMP_C = [70, 104, 132], STEEL = [156, 160, 164], CONCRETE = [176, 170, 158];
+const BOY = { shirt: [236, 234, 226], stripe: [236, 234, 226], legs: [46, 54, 88], knee: .8, hair: [30, 24, 22], skin: [176, 118, 82] };
+const GIRL = { shirt: [208, 78, 90], stripe: [242, 222, 208], legs: [208, 78, 90], knee: .95, hair: [24, 20, 20], skin: [184, 128, 90] };
+const UNCLE = { skin: [150, 100, 72], hair: [204, 200, 194] };
+const WHITE = rgb(255, 255, 255);
+const KIND_EARTH = 1, KIND_PATH = 2, KIND_MUD = 4;
+
+/* ---------- ground ---------- */
+function pathDistance(x, y) {
+  // the worn path the kids use, from the gap in the hedge to the tree
+  const pts = [[-8.6, 10.8], [-5.8, 5.4], [-4.4, 1.2], [-3.9, -1.4]];
+  let best = Infinity;
+  for (let k = 0; k < pts.length - 1; k++) {
+    const [ax, ay] = pts[k], [bx, by] = pts[k + 1], dx = bx - ax, dy = by - ay;
+    const t = clamp(((x - ax) * dx + (y - ay) * dy) / (dx * dx + dy * dy), 0, 1);
+    best = Math.min(best, Math.hypot(x - ax - dx * t, y - ay - dy * t));
+  }
+  return best;
+}
+function pickTone(tones, v, ix, iy) {
+  return rgb(...tones[clamp(Math.floor(v * tones.length + (bayerAt(ix, iy) - .5) * .6), 0, tones.length - 1)]);
+}
+function groundColor(x, y, ix, iy, i) {
+  const edge = Math.pow(Math.pow(Math.abs(x) / 10.6, 4) + Math.pow(Math.abs(y) / 10.6, 4), .25);
+  const rough = edge + (noise(x * 1.3, y * 1.3) - .5) * .13;
+  if (rough > 1.04) return 0;
+  if (rough > .93 && hash(ix, iy) < (rough - .93) / .11) return 0;
+  const fine = hash(ix, iy), pebble = fine > .978, pebbleShade = hash(ix - 1, iy - 1) > .978;
+  const behind = x < WALL - WALL_T || y < WALL - WALL_T;
+
+  const wet = Math.hypot(x - PUMP.x, y - PUMP.y - .7) + (noise(x * 2.5, y * 2.5) - .5) * .6;
+  if (wet < 1.25) {
+    kinds[i] = KIND_MUD;
+    if (wet < .55 && fine > .55) return rgb(150, 168, 172); // a puddle catching the sky
+    return pickTone(MUD, .35 + noise(x * 3, y * 3) * .5, ix, iy);
+  }
+  const tree = Math.hypot(x - TRUNK.x - .6, y - TRUNK.y + .3) + (noise(x * .8, y * .8) - .5) * 1.6;
+  const path = pathDistance(x, y) + (noise(x * 2, y * 2) - .5) * .5;
+  const wallFoot = !behind && Math.min(x - WALL, y - WALL) < .9 + noise(x * 1.7, y * 1.7) * .7;
+  if (!behind && (tree < 4.8 || wallFoot)) {
+    kinds[i] = KIND_EARTH;
+    // years of fallen leaves under the tree
+    if (tree < 4.4 && hash(ix * 3, iy * 7) > .955) return rgb(...DRY_LEAF[hash(ix, iy * 3) * 3 | 0]);
+    if (pebble) return rampOf(EARTH)[4];
+    if (pebbleShade) return rampOf(EARTH)[1];
+    return pickTone(EARTH_TONES, .5 + (noise(x * .9, y * .9) - .5) * .8 - Math.max(0, 2 - tree) * .08, ix, iy);
+  }
+  if (!behind && path < .8) {
+    kinds[i] = KIND_PATH;
+    if (pebble) return rampOf(EARTH)[4];
+    return pickTone(PATH_TONES, .45 + (noise(x * 1.2, y * 1.2) - .5) * .7 + (.8 - path) * .2, ix, iy);
+  }
+  kinds[i] = KIND_GRASS;
+  const t = noise(x * .9, y * .9) * 1.15 + (fine - .5) * .55 - .08;
+  if (noise(x * .35 + 7, y * .35 + 3) > .64) return pickTone(DRY_GRASS, t * .9, ix, iy); // summer: patches dry out
+  return rgb(...GRASS[clamp(Math.floor(t * 4.2), 0, 3)]);
+}
+
+/* ---------- static props ---------- */
+// a flat painted surface, for the charpai weave and the bucket's water
+function slab(x0, y0, x1, y1, z, colorAt) {
+  for (let a = x0; a <= x1; a += .045) for (let b = y0; b <= y1; b += .045) {
+    const c = colorAt(a, b);
+    if (!c) continue;
+    const p = project(a, b, z), ix = p.sx | 0, iy = p.sy | 0;
+    if (ix < 0 || iy < 0 || ix >= W || iy >= H) continue;
+    const i = iy * W + ix;
+    if (p.d <= zb[i]) continue;
+    zb[i] = p.d;
+    pix[i] = c;
+  }
+}
+function buildWalls() {
+  // the back wall along y = WALL, crumbling where it ends
+  for (let x = WALL - WALL_T, n = 0; x < 4.6; x += 1.5, n++) {
+    const top = WALL_H - (x > 2.4 ? (x - 2.4) * .3 : 0) - hash(n, 3) * .06;
+    box(x, WALL - WALL_T, 0, Math.min(x + 1.5, 4.6), WALL, top, n % 2 ? PLASTER : PLASTER_B, n * 7);
+    box(x, WALL - WALL_T - .04, top, Math.min(x + 1.5, 4.6), WALL + .04, top + .1, CAP, n);
+  }
+  // the side wall along x = WALL
+  for (let y = WALL, n = 0; y < 3.6; y += 1.5, n++) {
+    const top = WALL_H - (y > 1.6 ? (y - 1.6) * .3 : 0) - hash(n, 5) * .06;
+    box(WALL - WALL_T, y, 0, WALL, Math.min(y + 1.5, 3.6), top, n % 2 ? PLASTER_B : PLASTER, n * 5 + 30);
+    box(WALL - WALL_T - .04, y, top, WALL + .04, Math.min(y + 1.5, 3.6), top + .1, CAP, n + 20);
+  }
+  // plaster has fallen off in places, showing the bricks
+  const bricks = (x0, z0, rows, along) => {
+    for (let r = 0; r < rows; r++) for (let c = 0; c < 3 - (r % 2); c++) {
+      const a = x0 + c * .36 + (r % 2) * .18, z = z0 + r * .16;
+      if (along === 'x') box(a, WALL, z, a + .32, WALL + .03, z + .12, BRICK, r + c);
+      else box(WALL, a, z, WALL + .03, a + .32, z + .12, BRICK, r + c);
+    }
+  };
+  bricks(-6.2, .35, 3, 'x');
+  bricks(.8, .5, 2, 'x');
+  bricks(-4.2, .3, 3, 'y');
+  // an earthen pot left on the wall
+  const pot = [178, 94, 58];
+  sphere(WALL - .22, -6.3, WALL_H + .42, .32, pot, 'rough');
+  capsule([WALL - .22, -6.3, WALL_H + .62], [WALL - .22, -6.3, WALL_H + .78], .14, .16, () => pot, 'rough');
+  for (let x = -9.4; x <= 4.4; x += .35) castShadow(x, WALL - .2, WALL_H, .35);
+  for (let y = -9.2; y <= 3.4; y += .35) castShadow(WALL - .2, y, WALL_H, .35);
+  castShadow(WALL - .22, -6.3, WALL_H + .4, .34);
+}
+function buildCot() {
+  const { x0, y0, x1, y1, z } = COT;
+  for (const [x, y] of [[x0, y0], [x1 - .14, y0], [x0, y1 - .14], [x1 - .14, y1 - .14]]) box(x, y, 0, x + .14, y + .14, z, WOOD_DARK, x * 9 | 0);
+  box(x0, y0, z - .16, x1, y0 + .12, z, WOOD, 1);
+  box(x0, y1 - .12, z - .16, x1, y1, z, WOOD, 2);
+  box(x0, y0, z - .16, x0 + .12, y1, z, WOOD, 3);
+  box(x1 - .12, y0, z - .16, x1, y1, z, WOOD, 4);
+  // rope weave, with the shade under the cot showing through the gaps
+  const light = rgb(...ROPE), dark = rgb(190, 164, 118), gap = rgb(...ROPE_GAP);
+  slab(x0 + .12, y0 + .12, x1 - .12, y1 - .12, z - .05, (a, b) => {
+    const u = (a + b) * 2.6, v = (a - b) * 2.6, fu = u - Math.floor(u), fv = v - Math.floor(v);
+    if (fu < .55) return light;
+    if (fv < .55) return dark;
+    return gap;
+  });
+  // pillow at the head end, by the tree
+  box(x0 + .16, y0 + .26, z - .05, x0 + .62, y1 - .26, z + .14, [228, 224, 212], 9);
+  // his slippers, kicked off
+  box(x0 + .9, y1 + .35, 0, x0 + 1.22, y1 + .5, .05, [116, 66, 44], 1);
+  box(x0 + 1.3, y1 + .42, 0, x0 + 1.62, y1 + .57, .05, [116, 66, 44], 2);
+  for (let x = x0; x <= x1; x += .3) for (let y = y0; y <= y1; y += .3) castShadow(x, y, z, .3);
+}
+function buildPump() {
+  const { x, y } = PUMP;
+  box(x - .55, y - .45, 0, x + .55, y + .45, .1, CONCRETE, 2);
+  // the classic iron hand pump: a stand pipe, a boxy head, a spout and a long handle
+  capsule([x, y, .1], [x, y, .9], .13, .13, () => PUMP_C, 'solid');
+  box(x - .26, y - .22, .9, x + .26, y + .22, 1.32, PUMP_C, 4);
+  box(x - .3, y - .26, 1.32, x + .3, y + .26, 1.4, [52, 80, 104], 5);
+  capsule([x, y + .2, 1.08], [x, y + .62, 1.0], .08, .07, () => PUMP_C, 'solid');
+  capsule([x - .26, y, 1.3], [x - 1.5, y, 1.36], .05, .05, () => [40, 54, 66], 'solid');
+  capsule([x - 1.5, y, 1.36], [x - 1.7, y, 1.36], .07, .07, () => [40, 54, 66], 'solid');
+  // a steel bucket under the spout
+  capsule([x, y + .66, .18], [x, y + .66, .48], .22, .25, () => STEEL, 'gloss');
+  slab(x - .22, y + .44, x + .22, y + .88, .5, (a, b) => Math.hypot(a - x, b - y - .66) < .2 ? rgb(84, 112, 124) : 0);
+  for (let z = .2; z < 1.4; z += .2) castShadow(x, y, z, z > .9 ? .3 : .16);
+  castShadow(x, y + .66, .35, .28);
+  for (let a = .3; a < 1.7; a += .2) castShadow(x - a, y, 1.34, .08);
+}
+function buildSchoolThings() {
+  // the school bag he dropped on the way in, and a steel tiffin
+  box(-7.1, 4.7, 0, -6.4, 5.2, .45, [56, 72, 112], 3);
+  box(-7.12, 4.68, .3, -6.38, 5.22, .47, [70, 88, 132], 4);
+  capsule([-6.2, 5.6, .1], [-6.2, 5.6, .32], .16, .16, () => STEEL, 'gloss');
+  castShadow(-6.75, 4.95, .3, .45);
+  castShadow(-6.2, 5.6, .2, .18);
+}
+
+/* ---------- the mango tree ---------- */
+const BRANCHES = [];
+const LIMBS = [[-1.9, -.5, 3.8], [1.7, .6, 3.7], [.5, 1.8, 4], [-.6, -1.9, 4.2], [.1, .2, 4.8]];
+function growMangoTree() {
+  const T = TRUNK, bark = () => MANGO_BARK;
+  const seg = (a, b, r0, r1, solid = true) => {
+    capsule(a, b, r0, r1, bark, 'rough');
+    if (solid) BRANCHES.push({ a, b, r: Math.max(r0, r1) });
+    for (let k = 0; k <= 4; k++) {
+      const t = k / 4;
+      castShadow(lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t), lerp(r0, r1, t) * .9);
+    }
+  };
+  // roots flaring into the ground
+  for (let k = 0; k < 5; k++) {
+    const a = k * 1.26 + .4, c = Math.cos(a), s = Math.sin(a);
+    seg([T.x + c * 1.05, T.y + s * 1.05, .02], [T.x + c * .25, T.y + s * .25, .55], .1, .3, false);
+  }
+  const top = [T.x + .1, T.y + .05, 1.8];
+  seg([T.x, T.y, 0], top, .52, .4);
+  for (const [dx, dy, z] of LIMBS) {
+    const end = [T.x + dx, T.y + dy, z];
+    seg(top, end, .3, .17);
+    const len = Math.hypot(dx, dy) || 1;
+    for (const turn of [-.7, .7]) {
+      const c = Math.cos(turn), s = Math.sin(turn), ux = dx / len, uy = dy / len;
+      seg(end, [end[0] + (ux * c - uy * s) * 1.2, end[1] + (ux * s + uy * c) * 1.2, z + .8], .15, .08);
+    }
+  }
+  // a dense dome of leaf clusters, lit from the upper left, darker inside
+  const L = [-.61, .41, .68];
+  for (let k = 0; k < 1100; k++) {
+    const a = hash(k, 1) * 6.283, nz = hash(k, 2) * 2 - 1, flat = Math.sqrt(1 - nz * nz);
+    const nx = Math.cos(a) * flat, ny = Math.sin(a) * flat;
+    const depth = 1 - Math.pow(hash(k, 3), 2.2) * .6;
+    if (nz * depth < -.62) continue; // the crown's underside is fairly flat
+    const lump = .86 + .28 * noise(nx * 1.6 + 5, ny * 1.6 + nz * 1.6 + 5);
+    const ox = nx * depth * lump * CANOPY.rx, oy = ny * depth * lump * CANOPY.ry, oz = nz * depth * lump * CANOPY.rz;
+    const lit = nx * L[0] + ny * L[1] + nz * L[2];
+    const tone = .45 + lit * .5 * depth + (hash(k, 4) - .5) * .5 - (1 - depth) * .7;
+    const color = hash(k, 5) < .012 && nz > .5 ? LEAF_FLUSH : LEAF[clamp(Math.floor(tone * 4.4), 0, 4)];
+    const x = CANOPY.x + ox, y = CANOPY.y + oy, z = CANOPY.z + oz;
+    capture = [];
+    sphere(x, y, z, (color === LEAF_FLUSH ? .2 : .26) + hash(k, 6) * .22, color, 'rough');
+    leaves.push({ x, y, z, k, r: .5, pixels: capture });
+    capture = null;
+  }
+}
+const inCanopy = (x, y, z) =>
+  ((x - CANOPY.x) / CANOPY.rx) ** 2 + ((y - CANOPY.y) / CANOPY.ry) ** 2 + ((z - CANOPY.z) / CANOPY.rz) ** 2 < 1;
+
+/* ---------- bake ---------- */
+const leafZ = new Float32Array(W * H);
+function bake() {
+  zb.fill(-1e9);
+  pix.fill(WHITE);
+  for (let iy = 0; iy < H; iy++) for (let ix = 0; ix < W; ix++) {
+    const g = unproject(ix + .5, iy + .5), i = iy * W + ix, c = groundColor(g.x, g.y, ix, iy, i);
+    if (!c) continue;
+    pix[i] = c; ground[i] = 1;
+    zb[i] = (g.x + g.y) / R2 * COS;
+  }
+  growGrass();
+  groundZ.set(zb);
+  buildWalls();
+  buildCot();
+  buildPump();
+  buildSchoolThings();
+  growMangoTree();
+  bakeOcclusion();
+  staticShadow.set(shadowMask);
+  applyShadows(groundZ);
+  bakedPix.set(pix);
+  bakedZ.set(zb);
+  // where the leaves sit in depth, so mangoes only hang where you can see them
+  leafZ.fill(-1e9);
+  for (const leaf of leaves) for (let n = 0; n < leaf.pixels.length; n += 4) {
+    const i = leaf.pixels[n + 1] * W + leaf.pixels[n];
+    if (leaf.pixels[n + 2] > leafZ[i]) leafZ[i] = leaf.pixels[n + 2];
+  }
+}
+function hangMangoes() {
+  const list = [], toCot = [.85, -.52];
+  for (let tries = 0; list.length < MANGO_COUNT && tries < 6000; tries++) {
+    const a = Math.random() * 6.283, el = .1 - Math.random() * .85;
+    const nx = Math.cos(a) * Math.cos(el), ny = Math.sin(a) * Math.cos(el), nz = Math.sin(el);
+    if (nx + ny < -.2) continue; // the far side of the crown
+    const shell = .96 + Math.random() * .1;
+    const hx = CANOPY.x + nx * CANOPY.rx * shell, hy = CANOPY.y + ny * CANOPY.ry * shell, hz = CANOPY.z + nz * CANOPY.rz * shell;
+    if (list.some(m => Math.hypot(m.hx - hx, m.hy - hy, m.hz - hz) < .85)) continue;
+    const z = hz - STALK - .12, p = project(hx, hy, z);
+    const ix = p.sx | 0, iy = p.sy | 0;
+    if (ix < 1 || iy < 1 || ix >= W - 1 || iy >= H - 1 || p.d < leafZ[iy * W + ix] - .05) continue;
+    // the side over uncle's charpai gets the most sun, so the ripest fruit hangs there
+    const side = Math.max(0, nx * toCot[0] + ny * toCot[1]);
+    list.push({
+      hx, hy, hz, x: hx, y: hy, z, vx: 0, vy: 0, vz: 0, state: 'hang',
+      ripe: Math.random() < .28 + side * .5, tilt: 0, spin: 0, heading: Math.random() * 6.283, wobble: 0,
+    });
+  }
+  if (list.filter(m => m.ripe).length < 5) list.slice(0, 5).forEach(m => { m.ripe = true; });
+  return list;
+}
+
+/* ---------- state ---------- */
+const G = {
+  phase: 'play', time: 0, timer: 0, yaw: 0, power: 0, swing: -1, released: false, pointer: null,
+  stones: STONES, flying: [], pebbles: [], mangoes: [], basket: [], parts: [], zzz: [],
+  noise: 0, points: 0, ripe: 0, raw: 0, status: '', best: readBest(), dusk: 0,
+  uncle: { wake: 0, stir: 0, stirring: false, zzzT: 0, snoreT: 0 },
+  sister: null, boy: null, crow: null, dog: null, caughtBy: null, koelT: 6, crowsT: 3, dogsT: 11,
+  shake: 0, birds: [], roost: ROOST, roostT: 0, flockT: -9,
+};
+function readBest() { try { return +localStorage.getItem('mango-raid-best') || 0; } catch { return 0; } }
+function saveBest(v) { try { localStorage.setItem('mango-raid-best', String(v)); } catch {} }
+
+const nodes = {
+  score: document.getElementById('score'), stones: document.getElementById('stones'),
+  noise: document.getElementById('noise'), noiseLabel: document.getElementById('noise-label'),
+  dog: document.getElementById('dogm'), dogLabel: document.getElementById('dog-label'),
+  status: document.getElementById('status'),
+};
+nodes.stones.innerHTML = '<i></i>'.repeat(STONES);
+nodes.noise.innerHTML = '<i></i>'.repeat(10);
+nodes.dog.innerHTML = '<i></i>'.repeat(5);
+let hudKey = '';
+function renderHud() {
+  const level = Math.min(10, Math.ceil(G.noise * 10 - .001));
+  const label = G.uncle.wake > 0 ? 'uncle is awake!' : G.uncle.stirring ? 'uncle is stirring' : 'uncle asleep';
+  const dog = G.dog, dogLevel = dog.state === 'sleep' ? Math.min(5, Math.ceil(dog.alert * 5 - .001)) : 5;
+  const dogLabel = dog.state !== 'sleep' ? 'dog is awake!' : dog.listening ? 'dog is listening' : 'dog asleep';
+  const key = G.points + '|' + G.stones + '|' + level + '|' + label + '|' + dogLevel + '|' + dogLabel;
+  if (key === hudKey) return;
+  [...nodes.dog.children].forEach((el, k) => el.classList.toggle('off', k >= dogLevel));
+  nodes.dogLabel.textContent = dogLabel;
+  hudKey = key;
+  nodes.score.textContent = G.points;
+  [...nodes.stones.children].forEach((el, k) => el.classList.toggle('off', k >= G.stones));
+  [...nodes.noise.children].forEach((el, k) => el.classList.toggle('off', k >= level));
+  nodes.noiseLabel.textContent = label;
+}
+function setStatus(text) {
+  if (text === G.status) return;
+  G.status = text;
+  nodes.status.textContent = text;
+}
+const aimAtTree = () => Math.atan2(CANOPY.y - PLAYER.y, CANOPY.x - PLAYER.x + .6);
+
+function reset() {
+  G.phase = 'play'; G.timer = 0; G.swing = -1; G.power = 0; G.yaw = aimAtTree();
+  G.stones = STONES; G.flying = []; G.pebbles = []; G.basket = []; G.parts = []; G.zzz = [];
+  G.noise = 0; G.points = 0; G.ripe = 0; G.raw = 0; G.dusk = 0;
+  G.uncle = { wake: 0, stir: 0, stirring: false, zzzT: 0, snoreT: 1 };
+  G.mangoes = hangMangoes();
+  G.sister = { x: HOME.x, y: HOME.y, yaw: aimAtTree(), state: 'idle', path: [], walk: 0, t: 0, carry: null, mango: null, basket: false, gone: false };
+  G.boy = { x: PLAYER.x, y: PLAYER.y, walk: 0, gone: false };
+  G.crow = newCrow();
+  G.dog = newDog();
+  G.caughtBy = null;
+  G.shake = 0; G.birds = []; G.roost = ROOST; G.roostT = 0;
+  setStatus('drag back and release to throw');
+  renderHud();
+}
+
+/* ---------- noise and uncle ---------- */
+function makeNoise(amount, x, y) {
+  if (G.phase !== 'play') return;
+  // anything close to his head counts double
+  if (x != null && Math.hypot(x - (COT.x0 + .45), y - COT_Y) < 2.4) amount *= 2;
+  G.noise = Math.min(1, G.noise + amount);
+  if (amount >= .12 || (x != null && crowNear(x, y, null, 2.6))) startleCrow();
+  // the dog only really hears what lands near it, but a loud bang anywhere makes it listen
+  if (x != null) {
+    const d = Math.hypot(x - DOG.x, y - DOG.y);
+    if (d < 1.2) disturbDog(1); else if (d < 2.6) disturbDog(.55);
+  }
+  if (amount >= .12) disturbDog(.2);
+  if (G.noise >= 1) wake('uncle');
+}
+// uncle's shout wakes the dog and the dog's barking wakes uncle: either way, the kids run
+function wake(cause) {
+  if (G.phase !== 'play') return;
+  G.phase = 'caught'; G.timer = 0; G.caughtBy = cause;
+  G.uncle.wake = .001;
+  G.zzz = [];
+  if (cause === 'uncle') sound('shout', .6, cotPan());
+  else setTimeout(() => sound('shout', .6, cotPan()), 450);
+  wakeDog();
+  const s = G.sister;
+  if (s.mango) { s.mango.state = 'rest'; s.mango = null; }
+  s.state = 'flee'; s.path = s.basket ? [EXIT] : [standBy(BASKET, s), EXIT];
+  setStatus(cause === 'dog' ? 'the dog woke up! run!' : 'uncle woke up! run!');
+}
+function updateUncle(dt) {
+  const u = G.uncle;
+  if (u.wake > 0) { u.wake = Math.min(1, u.wake + dt * 2.2); return; }
+  const stirring = G.noise > STIR_AT;
+  if (stirring && !u.stirring) { sound('grunt', .6, cotPan()); setStatus('shh… uncle is stirring'); }
+  if (!stirring && u.stirring && G.phase === 'play') setStatus('');
+  u.stirring = stirring;
+  u.stir = lerp(u.stir, stirring ? 1 : 0, Math.min(1, dt * 4));
+  if (G.phase !== 'play' && G.phase !== 'done') return;
+  u.zzzT -= dt; u.snoreT -= dt;
+  if (u.zzzT <= 0 && !stirring) { u.zzzT = 1.3; G.zzz.push({ t: 0, big: G.zzz.length % 2 }); }
+  if (u.snoreT <= 0) { u.snoreT = 3.4; if (!stirring) sound('snore', .6, cotPan()); }
+}
+
+/* ---------- throwing ---------- */
+function release() {
+  if (G.power < .08 || G.stones <= 0 || G.swing >= 0 || G.phase !== 'play') { if (G.swing < 0) G.power = 0; return; }
+  G.swing = 0; G.released = false;
+  if (G.status === 'drag back and release to throw') setStatus('');
+}
+function launch() {
+  const fx = Math.cos(G.yaw), fy = Math.sin(G.yaw), v = G.power * MAX_SPEED;
+  const h = v * Math.cos(ELEVATION);
+  G.flying.push({ x: PLAYER.x + fx * .3, y: PLAYER.y + fy * .3, z: RELEASE_Z, vx: fx * h, vy: fy * h, vz: v * Math.sin(ELEVATION), inside: false, tok: 0 });
+  G.stones--;
+  sound('whoosh', .6, panAt(PLAYER.x, PLAYER.y, RELEASE_Z));
+}
+function landStone(s, z) {
+  G.pebbles.push({ x: s.x, y: s.y, z: z + STONE_R });
+}
+const offIsland = (x, y) => {
+  const p = project(x, y, 0), ix = p.sx | 0, iy = p.sy | 0;
+  return ix < 0 || iy < 0 || ix >= W || iy >= H || !ground[iy * W + ix];
+};
+const onCot = (x, y, pad = 0) => x > COT.x0 - pad && x < COT.x1 + pad && y > COT.y0 - pad && y < COT.y1 + pad;
+function segPoint(p, a, b) {
+  const dx = b[0] - a[0], dy = b[1] - a[1], dz = b[2] - a[2], ll = dx * dx + dy * dy + dz * dz || 1;
+  const t = clamp(((p.x - a[0]) * dx + (p.y - a[1]) * dy + (p.z - a[2]) * dz) / ll, 0, 1);
+  return [a[0] + dx * t, a[1] + dy * t, a[2] + dz * t];
+}
+function rustle(x, y, z, amount) {
+  sound('rustle', amount, panAt(x, y, z));
+  for (let k = 0; k < 3 + amount * 4; k++) {
+    G.parts.push({
+      kind: 'leaf', x: x + (Math.random() - .5), y: y + (Math.random() - .5), z: z - Math.random() * .5,
+      vx: (Math.random() - .5) * .6, vy: (Math.random() - .5) * .6, vz: -.4, life: 4, phase: Math.random() * 6,
+      color: rgb(...LEAF[1 + (Math.random() * 3 | 0)]),
+    });
+  }
+}
+function dust(x, y, n, color) {
+  for (let k = 0; k < n; k++) {
+    const a = Math.random() * 6.283, sp = .8 + Math.random() * 1.2;
+    G.parts.push({ kind: 'dust', x, y, z: .05, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, vz: 1 + Math.random() * 1.5, life: .45, color });
+  }
+}
+function stepStone(s, dt) {
+  s.vz -= GRAVITY * dt;
+  s.x += s.vx * dt; s.y += s.vy * dt; s.z += s.vz * dt;
+  s.tok = Math.max(0, s.tok - dt);
+  const inside = inCanopy(s.x, s.y, s.z);
+  if (inside && !s.inside) { rustle(s.x, s.y, s.z, .6); makeNoise(.025); }
+  s.inside = inside;
+  if (inside) { const k = 1 - 1.1 * dt; s.vx *= k; s.vy *= k; }
+  for (const m of G.mangoes) {
+    if (m.state !== 'hang' || Math.hypot(s.x - m.x, s.y - m.y, s.z - m.z) > HIT_R) continue;
+    knock(m, s);
+    s.vx *= -.25; s.vy *= -.25; s.vz = Math.min(s.vz, 0) - 1;
+    break;
+  }
+  for (const b of BRANCHES) {
+    const c = segPoint(s, b.a, b.b), dx = s.x - c[0], dy = s.y - c[1], dz = s.z - c[2], d = Math.hypot(dx, dy, dz);
+    if (d > b.r + STONE_R || !d) continue;
+    const nx = dx / d, ny = dy / d, nz = dz / d, dot = s.vx * nx + s.vy * ny + s.vz * nz;
+    s.x = c[0] + nx * (b.r + STONE_R); s.y = c[1] + ny * (b.r + STONE_R); s.z = c[2] + nz * (b.r + STONE_R);
+    if (dot < 0) { s.vx = (s.vx - 1.6 * dot * nx) * .55; s.vy = (s.vy - 1.6 * dot * ny) * .55; s.vz = (s.vz - 1.6 * dot * nz) * .55; }
+    if (!s.tok && -dot > 1.5) {
+      s.tok = .2;
+      sound('tok', Math.min(1, -dot / 8), panAt(s.x, s.y, s.z));
+      makeNoise(.13, s.x, s.y);
+      shakeTree(Math.min(1, -dot / 7));
+    }
+  }
+  if (crowNear(s.x, s.y, s.z, 1.5)) startleCrow();
+  // a stone that hits the sleeping dog
+  if (G.dog.state === 'sleep' && Math.hypot(s.x - DOG.x, s.y - DOG.y, s.z - .25) < .55) {
+    sound('yelp', .6, panAt(DOG.x, DOG.y)); disturbDog(1);
+    s.vx *= -.3; s.vy *= -.3; s.vz = 1.5;
+  }
+  // the man himself
+  const head = [COT.x0 + .45, COT_Y, COT.z + .4], belly = [COT.x0 + 1.15, COT_Y, COT.z + .4];
+  if (Math.hypot(s.x - head[0], s.y - head[1], s.z - head[2]) < .45 || Math.hypot(s.x - belly[0], s.y - belly[1], s.z - belly[2]) < .5) {
+    sound('bonk', .6, cotPan()); makeNoise(1);
+    s.vx *= -.3; s.vy *= -.3; s.vz = 2;
+  }
+  // walls: the stone clacks off them, or sails over into the neighbour's yard
+  if (!s.over && s.z < WALL_H + .1) {
+    if (s.x < WALL + STONE_R && s.x > WALL - WALL_T - .2 && s.y > WALL - WALL_T && s.y < 3.6) {
+      s.x = WALL + STONE_R; s.vx = Math.abs(s.vx) * .4; sound('clack', .6, panAt(s.x, s.y, s.z)); makeNoise(.16, s.x, s.y);
+    }
+    if (s.y < WALL + STONE_R && s.y > WALL - WALL_T - .2 && s.x > WALL - WALL_T && s.x < 4.6) {
+      s.y = WALL + STONE_R; s.vy = Math.abs(s.vy) * .4; sound('clack', .6, panAt(s.x, s.y, s.z)); makeNoise(.16, s.x, s.y);
+    }
+  }
+  if (s.x < WALL - WALL_T || s.y < WALL - WALL_T) s.over = true;
+  if (onCot(s.x, s.y) && s.z < COT.z + STONE_R && s.vz < 0) {
+    sound('creak', .6, cotPan()); makeNoise(.3, s.x, s.y);
+    landStone(s, COT.z);
+    return false;
+  }
+  if (s.z <= STONE_R) {
+    if (s.over || offIsland(s.x, s.y)) { if (s.over) makeNoise(.04); return false; }
+    s.z = STONE_R;
+    if (s.vz < -3) {
+      sound('thud', Math.min(1, -s.vz / 10), panAt(s.x, s.y)); makeNoise(.04, s.x, s.y);
+      dust(s.x, s.y, 3, rgb(...EARTH_TONES[3]));
+      s.vz *= -.25; s.vx *= .45; s.vy *= .45;
+    } else {
+      landStone(s, 0);
+      return false;
+    }
+  }
+  return true;
+}
+/* ---------- shaking the tree ---------- */
+// a stone that cracks into the trunk or a branch shakes the whole crown: leaves shiver and fall,
+// hanging mangoes swing (a hard knock can shake one loose) and the birds roosting inside burst out
+const BIRD_C = rgb(52, 42, 38);
+function shakeTree(force) {
+  G.shake = Math.max(G.shake, .5 + force * .5);
+  for (const m of G.mangoes) if (m.state === 'hang') m.wobble = Math.max(m.wobble, .5 + force * .5);
+  sound('rustle', 1, panAt(CANOPY.x, CANOPY.y, CANOPY.z));
+  for (let k = 0; k < 6 + force * 8; k++) {
+    const a = Math.random() * 6.283, r = Math.random() * CANOPY.rx * .9;
+    G.parts.push({
+      kind: 'leaf', x: CANOPY.x + Math.cos(a) * r, y: CANOPY.y + Math.sin(a) * r, z: CANOPY.z - CANOPY.rz * .6,
+      vx: (Math.random() - .5) * .6, vy: (Math.random() - .5) * .6, vz: -.5 - Math.random() * .4, life: 5, phase: Math.random() * 6,
+      color: rgb(...LEAF[1 + (Math.random() * 3 | 0)]),
+    });
+  }
+  const hanging = G.mangoes.filter(m => m.state === 'hang');
+  if (hanging.length && force > .35 && Math.random() < .25 + force * .3) {
+    knock(hanging[(Math.random() * hanging.length) | 0], { vx: (Math.random() - .5) * 4, vy: (Math.random() - .5) * 4 });
+  }
+  if (G.roost > 0 && G.time - G.flockT > 2.5) {
+    const n = Math.min(G.roost, 3 + (Math.random() * 4 | 0));
+    G.roost -= n; G.flockT = G.time;
+    for (let k = 0; k < n; k++) {
+      // out of the top of the crown, so they are against the sky almost at once
+      const a = Math.random() * 6.283, out = 3 + Math.random() * 2.5, r = 1 + Math.random() * 1.6;
+      G.birds.push({
+        x: CANOPY.x + Math.cos(a) * r, y: CANOPY.y + Math.sin(a) * r, z: CANOPY.z + CANOPY.rz * (.5 + Math.random() * .4),
+        vx: Math.cos(a) * out, vy: Math.sin(a) * out, vz: 2.4 + Math.random() * 1.8, flap: Math.random() * 6, rate: 14 + Math.random() * 6, age: -k * .07,
+      });
+    }
+    sound('flock', .6 + force * .4, panAt(CANOPY.x, CANOPY.y, CANOPY.z));
+    makeNoise(.04);
+  }
+}
+function updateTree(dt) {
+  G.shake = Math.max(0, G.shake - dt * 1.8);
+  // birds drift back into the tree a while after a scare
+  G.roostT += dt;
+  if (G.roostT > 7) { G.roostT = 0; G.roost = Math.min(ROOST, G.roost + 1); }
+  G.birds = G.birds.filter(b => {
+    b.age += dt;
+    if (b.age < 0) return true;
+    b.flap += dt * b.rate;
+    b.vz += dt * .9;
+    b.x += b.vx * dt; b.y += b.vy * dt; b.z += b.vz * dt + Math.sin(b.flap * .5) * dt * .6;
+    const p = project(b.x, b.y, b.z);
+    return b.age < 5 && p.sx > -8 && p.sx < W + 8 && p.sy > -8;
+  });
+}
+const BIRD_UP = ['x...x', '.x.x.', '..x..'], BIRD_DOWN = ['.....', 'xx.xx', '..x..'];
+// small dark birds with a pale outline, so they read against the leaves as well as the sky
+function drawBirds() {
+  const ink = [];
+  for (const b of G.birds) {
+    if (b.age < 0) continue;
+    const p = project(b.x, b.y, b.z), left = Math.round(p.sx) - 2, top = Math.round(p.sy) - 1;
+    (Math.floor(b.flap) % 2 ? BIRD_UP : BIRD_DOWN).forEach((row, y) => [...row].forEach((c, x) => { if (c === 'x') ink.push([left + x, top + y]); }));
+  }
+  haloDots(ink);
+  drawDots(ink, BIRD_C);
+}
+
+function knock(m, s) {
+  m.state = 'fall';
+  m.vx = s.vx * .12 + (Math.random() - .5) * .4;
+  m.vy = s.vy * .12 + (Math.random() - .5) * .4;
+  m.vz = .6;
+  m.spin = (Math.random() < .5 ? -1 : 1) * (4 + Math.random() * 4);
+  sound('snap', .6, panAt(m.x, m.y, m.z));
+  rustle(m.x, m.y, m.z + .4, .4);
+  makeNoise(.02);
+}
+function stepMango(m, dt) {
+  if (m.state === 'hang') { m.wobble = Math.max(0, m.wobble - dt); return; }
+  if (m.state !== 'fall' && m.state !== 'roll') return;
+  m.vz -= GRAVITY * dt;
+  m.x += m.vx * dt; m.y += m.vy * dt; m.z += m.vz * dt;
+  if (m.state === 'fall') m.tilt += m.spin * dt;
+  const floor = onCot(m.x, m.y) ? COT.z + MANGO_R * .8 : MANGO_R * .8;
+  if (m.z > floor) return;
+  m.z = floor;
+  if (m.vz < -2.5) {
+    const hard = Math.min(1, -m.vz / 9);
+    if (floor > .5) { sound('creak', .6, cotPan()); makeNoise(.3, m.x, m.y); }
+    else { sound('thump', hard, panAt(m.x, m.y)); makeNoise(m.ripe ? .07 : .05, m.x, m.y); dust(m.x, m.y, 4, rgb(...EARTH_TONES[3])); }
+    m.vz *= -.22; m.vx *= .5; m.vy *= .5;
+    m.state = 'roll'; m.tilt = Math.PI / 2; m.spin = 0;
+    return;
+  }
+  m.vz = 0;
+  const sp = Math.hypot(m.vx, m.vy), next = Math.max(0, sp - 5 * dt);
+  if (next < .05) { m.vx = 0; m.vy = 0; m.state = 'rest'; m.tilt = Math.PI / 2; return; }
+  m.vx *= next / sp; m.vy *= next / sp;
+}
+
+/* ---------- little sister ---------- */
+function standBy(target, from, gap = .55) {
+  const dx = target.x - from.x, dy = target.y - from.y, d = Math.hypot(dx, dy) || 1;
+  let x = target.x - dx / d * gap, y = target.y - dy / d * gap;
+  if (onCot(x, y, .3)) { x = clamp(target.x, COT.x0 + .2, COT.x1 - .2); y = COT.y1 + .5; }
+  return { x, y };
+}
+// a walking route that goes round the trunk, the dog and the charpai instead of through them
+const OBSTACLES = [{ x: TRUNK.x, y: TRUNK.y, r: 1.3, clear: 1.6 }, { x: DOG.x, y: DOG.y, r: .9, clear: 1.25 }];
+function route(from, to) {
+  const pts = [];
+  if (onCot((from.x + to.x) / 2, (from.y + to.y) / 2, .4) || (from.y > COT.y1 && to.y < COT.y0 && to.x > COT.x0 - .5 && to.x < COT.x1 + .5)) {
+    const endX = Math.abs(to.x - (COT.x0 - .6)) < Math.abs(to.x - (COT.x1 + .6)) ? COT.x0 - .6 : COT.x1 + .6;
+    pts.push({ x: endX, y: from.y > COT_Y ? COT.y1 + .6 : COT.y0 - .6 }, { x: endX, y: to.y > COT_Y ? COT.y1 + .6 : COT.y0 - .6 });
+  }
+  pts.push(to);
+  const out = [];
+  let prev = from;
+  for (const p of pts) {
+    const dx = p.x - prev.x, dy = p.y - prev.y, ll = dx * dx + dy * dy || 1;
+    for (const o of OBSTACLES) {
+      const t = clamp(((o.x - prev.x) * dx + (o.y - prev.y) * dy) / ll, 0, 1);
+      const cx = prev.x + dx * t - o.x, cy = prev.y + dy * t - o.y, d = Math.hypot(cx, cy);
+      if (d < o.r && t > .05 && t < .95) {
+        const len = Math.sqrt(ll), nx = d ? cx / d : -dy / len, ny = d ? cy / d : dx / len;
+        out.push({ x: o.x + nx * o.clear, y: o.y + ny * o.clear });
+      }
+    }
+    out.push(p);
+    prev = p;
+  }
+  return out;
+}
+function walk(f, dt, speed) {
+  const p = f.path[0];
+  if (!p) return true;
+  const dx = p.x - f.x, dy = p.y - f.y, d = Math.hypot(dx, dy), step = speed * dt;
+  if (d > .01) f.yaw = Math.atan2(dy, dx);
+  f.walk += dt * speed * 3.4;
+  if (d <= step) { f.x = p.x; f.y = p.y; f.path.shift(); return !f.path.length; }
+  f.x += dx / d * step; f.y += dy / d * step;
+  return false;
+}
+function updateSister(dt) {
+  const s = G.sister;
+  s.t += dt;
+  if (s.state === 'flee') {
+    if (walk(s, dt, 4.6) && !s.gone) s.gone = true;
+    if (!s.basket && Math.hypot(s.x - BASKET.x, s.y - BASKET.y) < .8) { s.basket = true; sound('pop', .6, panAt(BASKET.x, BASKET.y)); }
+    if (s.path.length && s.path[0] === EXIT && !s.basket) s.basket = true;
+    return;
+  }
+  if (s.state === 'idle' || s.state === 'home') {
+    const waiting = G.mangoes.filter(m => m.state === 'rest');
+    if (waiting.length) {
+      waiting.sort((a, b) => Math.hypot(a.x - s.x, a.y - s.y) - Math.hypot(b.x - s.x, b.y - s.y));
+      s.mango = waiting[0]; s.mango.state = 'claimed';
+      s.path = route(s, standBy(s.mango, s)); s.state = 'go';
+      return;
+    }
+    if (s.state === 'idle' && Math.hypot(s.x - HOME.x, s.y - HOME.y) > .05) { s.path = route(s, HOME); s.state = 'home'; }
+    if (s.state === 'home' && walk(s, dt, 2.4)) { s.state = 'idle'; s.yaw = aimAtTree(); }
+    if (s.state === 'idle' && !s.path.length) s.walk = 0;
+    return;
+  }
+  if (s.state === 'go' && walk(s, dt, 3)) {
+    s.state = 'pick'; s.t = 0;
+    s.yaw = Math.atan2(s.mango.y - s.y, s.mango.x - s.x);
+  }
+  if (s.state === 'pick' && s.t > .35) {
+    s.mango.state = 'carried';
+    s.path = route(s, standBy(BASKET, s, .7)); s.state = 'back';
+  }
+  if (s.state === 'back' && walk(s, dt, 3)) {
+    s.state = 'drop'; s.t = 0;
+    s.yaw = Math.atan2(BASKET.y - s.y, BASKET.x - s.x);
+  }
+  if (s.state === 'drop' && s.t > .3) {
+    const m = s.mango;
+    m.state = 'basket';
+    G.basket.push(m);
+    G.points += m.ripe ? 3 : 1;
+    if (m.ripe) G.ripe++; else G.raw++;
+    sound('pop', .6, panAt(BASKET.x, BASKET.y));
+    s.mango = null; s.state = 'idle';
+  }
+}
+
+/* ---------- the crow ---------- */
+// a house crow keeps watch from the wall. Startle it and it flies off cawing, which uncle hears too
+const CROW_BLACK = [38, 38, 44], CROW_GRAY = [108, 108, 114], BEAK = [28, 26, 24];
+// it leaves (and comes back) straight out over the wall it sits on, so it never passes behind the tree
+const awayFrom = spot => spot.x < WALL ? { x: spot.x - 7, y: spot.y - 1.5, z: 8 } : { x: spot.x + 1.5, y: spot.y - 7, z: 8 };
+// side-on to the camera, facing screen left or right: a crow reads best in profile
+const profileYaw = () => (Math.random() < .5 ? -Math.PI / 4 : Math.PI * .75) + (Math.random() - .5) * .5;
+const crowVisible = (x, y, z) => {
+  for (const dz of [.2, .45]) {
+    const p = project(x, y, z + dz), ix = p.sx | 0, iy = p.sy | 0;
+    if (ix < 0 || iy < 0 || ix >= W || iy >= H || p.d < leafZ[iy * W + ix]) return false;
+  }
+  return true;
+};
+function perchSpot() {
+  for (let tries = 0; ; tries++) {
+    const yaw = profileYaw();
+    let spot;
+    if (Math.random() < .5) spot = { x: -7.6 + Math.random() * 9.4, y: WALL - WALL_T / 2, z: WALL_H + .1, yaw };
+    else {
+      let y = -7.8 + Math.random() * 9;
+      if (Math.abs(y + 6.3) < .7) y += 1.4; // not on the pot
+      spot = { x: WALL - WALL_T / 2, y, z: WALL_H + .1, yaw };
+    }
+    // somewhere you can see it, not hidden behind the leaves
+    if (crowVisible(spot.x, spot.y, spot.z) || tries > 200) return spot;
+  }
+}
+function newCrow() {
+  const p = perchSpot();
+  return { ...p, base: p, state: 'perch', next: 2, hop: 0, hopFrom: null, hopTo: null, peck: 0, flap: 0, u: 0, from: null, cawT: 8 + Math.random() * 8 };
+}
+function startleCrow() {
+  const c = G.crow;
+  if (c.state !== 'perch' && c.state !== 'land') return;
+  c.state = 'fly'; c.from = { x: c.x, y: c.y, z: c.z }; c.to = awayFrom(c.base); c.u = 0;
+  sound('alarm', .6, panAt(c.x, c.y, c.z));
+  makeNoise(.08);
+}
+function crowNear(x, y, z, r) {
+  const c = G.crow;
+  return (c.state === 'perch' || c.state === 'land') && Math.hypot(x - c.x, y - c.y, (z ?? c.z) - c.z) < r;
+}
+function updateCrow(dt) {
+  const c = G.crow;
+  c.flap += dt * 24;
+  c.peck = Math.max(0, c.peck - dt * 2.5);
+  if (c.state === 'perch') {
+    if (c.hop > 0) {
+      c.hop = Math.max(0, c.hop - dt * 3.5);
+      const t = 1 - c.hop;
+      c.x = lerp(c.hopFrom.x, c.hopTo.x, t); c.y = lerp(c.hopFrom.y, c.hopTo.y, t);
+      c.z = c.base.z + Math.sin(t * Math.PI) * .28;
+    }
+    c.next -= dt; c.cawT -= dt;
+    if (c.cawT <= 0) { c.cawT = 12 + Math.random() * 14; c.peck = 0; sound('caw', .7, panAt(c.x, c.y, c.z)); }
+    if (c.next > 0) return;
+    c.next = .8 + Math.random() * 2.6;
+    const r = Math.random();
+    if (r < .35) {
+      // a sideways hop along the wall top
+      const along = c.base.y === WALL - WALL_T / 2 ? 'x' : 'y', step = (Math.random() < .5 ? -1 : 1) * (.25 + Math.random() * .3);
+      const to = { x: c.x, y: c.y };
+      to[along] = clamp(to[along] + step, -8, along === 'x' ? 1.8 : 1.2);
+      if ((along === 'y' && Math.abs(to.y + 6.3) < .6) || !crowVisible(to.x, to.y, c.base.z)) return;
+      c.hopFrom = { x: c.x, y: c.y }; c.hopTo = to; c.hop = 1;
+      c.yaw = profileYaw();
+    } else if (r < .7) c.peck = 1;
+    else c.yaw = profileYaw();
+    return;
+  }
+  if (c.state === 'fly') {
+    c.u = Math.min(1, c.u + dt / 1.6);
+    const t = c.u, e = t * t;
+    c.x = lerp(c.from.x, c.to.x, e); c.y = lerp(c.from.y, c.to.y, e);
+    c.z = lerp(c.from.z, c.to.z, Math.sqrt(t));
+    c.yaw = Math.atan2(c.to.y - c.from.y, c.to.x - c.from.x);
+    if (t >= 1) { c.state = 'away'; c.next = 10 + Math.random() * 10; }
+    return;
+  }
+  if (c.state === 'away') {
+    c.next -= dt;
+    if (c.next > 0 || G.phase === 'caught') return;
+    c.base = perchSpot(); c.state = 'land'; c.u = 0; c.from = awayFrom(c.base);
+    return;
+  }
+  if (c.state === 'land') {
+    // glide in on a curve and settle on the wall
+    c.u = Math.min(1, c.u + dt / 2.4);
+    const t = c.u, k = ease(t), b = c.base;
+    c.x = lerp(c.from.x, b.x, k); c.y = lerp(c.from.y, b.y, k);
+    c.z = lerp(c.from.z, b.z, k) + Math.sin(t * Math.PI) * 1.2;
+    c.yaw = Math.atan2(b.y - c.from.y, b.x - c.from.x);
+    if (t >= 1) { Object.assign(c, { x: b.x, y: b.y, z: b.z, yaw: b.yaw, state: 'perch', next: 1.5 }); sound('caw', .5, panAt(b.x, b.y, b.z)); }
+  }
+}
+function drawCrow() {
+  const c = G.crow;
+  if (c.state === 'away') return;
+  const fx = Math.cos(c.yaw), fy = Math.sin(c.yaw), sx = -fy, sy = fx;
+  const flying = c.state !== 'perch', K = 1.5; // drawn a little larger than life so it reads at this resolution
+  const at = (f, s, z) => [c.x + (fx * f + sx * s) * K, c.y + (fy * f + sy * s) * K, c.z + z * K];
+  const black = () => CROW_BLACK;
+  // perched it sits up, chest high and tail drooping; in the air it stretches out flat
+  const lift = flying ? .05 : .13, up = flying ? 0 : 1;
+  limb(at(.12, 0, lift + .05 + up * .09), at(-.19, 0, lift + up * .02), .15 * K, .11 * K, black);
+  limb(at(-.19, 0, lift + up * .02), at(-.42, 0, lift - up * .14), .07 * K, .05 * K, black);
+  const p = c.peck;
+  sphere(...at(.16 + p * .06, 0, lift + .17 + up * .07 - p * .14), .1 * K, CROW_GRAY, 'solid');
+  const head = at(.22 + p * .12, 0, lift + .28 + up * .08 - p * .3);
+  sphere(head[0], head[1], head[2], .1 * K, CROW_BLACK, 'solid');
+  sphere(...at(.36 + p * .12, 0, lift + .26 + up * .08 - p * .32), .05 * K, BEAK, 'solid');
+  pendingShadows.push(head, .1 * K, head, .1 * K);
+  if (flying) {
+    const beat = Math.sin(c.flap) * (c.state === 'land' && c.u > .8 ? .5 : 1);
+    for (const side of [-1, 1]) limb(at(0, side * .08, lift + .05), at(-.08, side * .5, lift + .05 + beat * .32), .08 * K, .04 * K, black);
+  }
+}
+
+/* ---------- the dog ---------- */
+// a street dog asleep in the shade. One disturbance nearby and it lifts its head to listen;
+// another before it settles and it wakes, barks, and chases you out of the yard
+// a white street dog with brown patches, so it stands out against the bare earth
+const DOG_COAT = [236, 228, 212], DOG_PALE = [246, 242, 232], DOG_PATCH = [170, 104, 58], DOG_DARK = [118, 70, 42], DOG_NOSE = [34, 28, 26];
+const DOG_LISTEN = .35, DOG_SETTLE = .05, DOG_SPEED = 5.4;
+const DOG_STOP = { x: -6.4, y: 9.4 }; // it sees you off at the edge of the yard, then stays
+function newDog() {
+  return { x: DOG.x, y: DOG.y, yaw: DOG.yaw, state: 'sleep', alert: 0, listening: false, t: 0, run: 0, moving: false, barkT: 0, barks: 0, bark: 0 };
+}
+function disturbDog(amount) {
+  const d = G.dog;
+  if (!d || d.state !== 'sleep' || G.phase !== 'play') return;
+  d.alert += amount;
+  if (d.alert >= 1) wake('dog');
+}
+function wakeDog() {
+  const d = G.dog;
+  if (d.state !== 'sleep') return;
+  d.state = 'up'; d.t = 0; d.alert = 1;
+  bark(d);
+}
+function bark(d) { d.bark = .22; d.barks++; sound('bark', .6, panAt(d.x, d.y, .6)); }
+function updateDog(dt) {
+  const d = G.dog;
+  d.t += dt;
+  d.bark = Math.max(0, d.bark - dt);
+  if (d.state === 'sleep') {
+    d.alert = Math.max(0, d.alert - DOG_SETTLE * dt);
+    const listening = d.alert > DOG_LISTEN;
+    if (listening && !d.listening && G.phase === 'play') { sound('growl', .6, panAt(d.x, d.y)); setStatus('the dog lifts its head…'); }
+    if (!listening && d.listening && G.status === 'the dog lifts its head…') setStatus('');
+    d.listening = listening;
+    return;
+  }
+  if (d.state === 'up') {
+    if (d.t > .35) { d.state = 'chase'; d.barkT = .25; }
+    return;
+  }
+  // straight at the boy, a step behind him, until he is out of the yard
+  const b = G.boy;
+  let tx = DOG_STOP.x, ty = DOG_STOP.y;
+  if (!b.gone) {
+    const dx = b.x - d.x, dy = b.y - d.y, dd = Math.hypot(dx, dy) || 1;
+    tx = b.x - dx / dd * .7; ty = b.y - dy / dd * .7;
+    if (Math.hypot(tx - EXIT.x, ty - EXIT.y) < Math.hypot(DOG_STOP.x - EXIT.x, DOG_STOP.y - EXIT.y)) { tx = DOG_STOP.x; ty = DOG_STOP.y; }
+  }
+  const dx = tx - d.x, dy = ty - d.y, dd = Math.hypot(dx, dy), step = DOG_SPEED * dt;
+  d.moving = dd > .05;
+  if (d.moving) {
+    d.yaw = Math.atan2(dy, dx);
+    const k = Math.min(1, step / dd);
+    d.x += dx * k; d.y += dy * k;
+    d.run += dt * 15;
+  } else d.yaw = Math.atan2(EXIT.y - d.y, EXIT.x - d.x);
+  d.barkT -= dt;
+  if (d.barkT <= 0 && d.barks < 10) { bark(d); d.barkT = d.moving ? .6 : .9; }
+}
+function drawDog() {
+  const d = G.dog, fx = Math.cos(d.yaw), fy = Math.sin(d.yaw), sx = -fy, sy = fx;
+  const at = (f, s, z) => [d.x + fx * f + sx * s, d.y + fy * f + sy * s, z];
+  const coat = () => DOG_COAT, pale = () => DOG_PALE, dark = () => DOG_DARK, patch = () => DOG_PATCH;
+  const pawTips = t => (t > .7 ? DOG_PALE : DOG_COAT);
+  if (d.state === 'sleep') {
+    // curled up: haunch, body, pale chest, paws out front, tail wrapped round, head down on the paws
+    const breathe = STILL ? 0 : Math.sin(G.time * 1.3) * .02, lift = ease(clamp((d.alert - .2) / .25, 0, 1));
+    const haunch = at(-.32, .06, .25);
+    sphere(haunch[0], haunch[1], haunch[2], .28 + breathe, DOG_PATCH, 'solid');
+    pendingShadows.push(haunch, .28, haunch, .28);
+    limb(at(-.24, 0, .22), at(.16, 0, .22), .24 + breathe, .22, coat);
+    sphere(...at(.22, -.02, .2), .16, DOG_PALE, 'solid');
+    limb(at(.18, .1, .06), at(.5, .12, .05), .07, .06, pale);
+    limb(at(.18, -.08, .06), at(.48, -.06, .05), .07, .06, pale);
+    limb(at(-.56, 0, .12), at(-.46, .32, .07), .07, .06, patch);
+    limb(at(-.46, .32, .07), at(-.14, .42, .07), .06, .05, patch);
+    const hz = .17 + lift * .3, head = at(.42 - lift * .04, .02, hz);
+    sphere(head[0], head[1], head[2], .16, DOG_COAT, 'solid');
+    pendingShadows.push(head, .16, head, .16);
+    limb(head, at(.6, .02, hz - .04), .09, .07, pale, 'solid', false);
+    sphere(...at(.66, .02, hz - .03), .045, DOG_NOSE, 'solid');
+    // ears flop when asleep and prick up when it listens
+    for (const s of [-.09, .09]) {
+      if (lift > .5) limb(at(.38, s, hz + .1), at(.36, s, hz + .24), .055, .03, dark, 'solid', false);
+      else sphere(...at(.34, s, hz + .08), .06, DOG_DARK, 'solid');
+    }
+    return;
+  }
+  // up on its feet, and running if there is somewhere to go
+  const rise = d.state === 'up' ? ease(clamp(d.t / .35, 0, 1)) : 1;
+  const bob = d.moving ? Math.abs(Math.sin(d.run)) * .07 : 0, hz = lerp(.22, .46, rise) + bob;
+  for (const [f, s, ph] of [[.24, .1, 0], [.24, -.1, .6], [-.26, .1, Math.PI], [-.26, -.1, Math.PI + .6]]) {
+    const sw = d.moving ? Math.sin(d.run + ph) * .22 : 0;
+    limb(at(f, s, hz), at(f + sw, s, .03), .07, .055, pawTips);
+  }
+  limb(at(-.3, 0, hz + .04), at(.24, 0, hz + .08), .2, .21, coat);
+  sphere(...at(-.14, 0, hz + .14), .16, DOG_PATCH, 'solid'); // the brown saddle
+  sphere(...at(.3, 0, hz + .02), .15, DOG_PALE, 'solid');
+  const head = at(.46, 0, hz + .32);
+  sphere(head[0], head[1], head[2], .16, DOG_COAT, 'solid');
+  pendingShadows.push(head, .16, head, .16);
+  limb(head, at(.66, 0, hz + .27), .09, .07, pale, 'solid', false);
+  sphere(...at(.72, 0, hz + .28), .045, DOG_NOSE, 'solid');
+  for (const s of [-.08, .08]) limb(at(.42, s, hz + .44), at(.4, s * 1.1, hz + .58), .055, .03, dark, 'solid', false);
+  const wag = Math.sin(G.time * 14) * .12;
+  limb(at(-.34, 0, hz + .1), at(-.5, wag, hz + .36), .05, .04, patch);
+}
+// little lines bursting from its snout on each bark
+function drawDogBark() {
+  const d = G.dog;
+  if (d.bark <= 0 || d.state === 'sleep') return;
+  const fx = Math.cos(d.yaw), fy = Math.sin(d.yaw), hz = .78;
+  const a = project(d.x + fx * .74, d.y + fy * .74, hz), b = project(d.x + fx * 1.2, d.y + fy * 1.2, hz);
+  const len = Math.hypot(b.sx - a.sx, b.sy - a.sy), nx = len > .5 ? (b.sx - a.sx) / len : 1, ny = len > .5 ? (b.sy - a.sy) / len : 0;
+  const dots = [];
+  for (const ang of [-.75, 0, .75]) {
+    const c = Math.cos(ang), s = Math.sin(ang), dx = nx * c - ny * s, dy = nx * s + ny * c;
+    for (let k = 3; k <= 5; k++) dots.push([a.sx + dx * k, a.sy + dy * k]);
+  }
+  drawDots(dots, INK);
+}
+
+/* ---------- loop ---------- */
+function updateParts(dt) {
+  G.parts = G.parts.filter(p => {
+    p.life -= dt;
+    if (p.kind === 'leaf') {
+      if (p.z > 0) {
+        p.x += (p.vx + Math.sin(G.time * 3 + p.phase) * .6) * dt; p.y += p.vy * dt; p.z = Math.max(0, p.z + p.vz * dt);
+      }
+    } else {
+      p.vz -= GRAVITY * .5 * dt;
+      p.x += p.vx * dt; p.y += p.vy * dt; p.z = Math.max(0, p.z + p.vz * dt);
+    }
+    return p.life > 0;
+  });
+  G.zzz = G.zzz.filter(z => (z.t += dt) < 2.4);
+}
+function settled() {
+  return !G.flying.length && G.swing < 0 && G.mangoes.every(m => m.state === 'hang' || m.state === 'basket') && G.sister.state === 'idle';
+}
+function finish() {
+  G.phase = 'done'; G.timer = 0;
+  if (G.points > G.best) { G.best = G.points; saveBest(G.best); }
+  sound('evening');
+  setStatus('evening. ' + G.ripe + ' ripe, ' + G.raw + ' raw · ' + G.points + ' points · best ' + G.best + ' · tap to play again');
+}
+function update(dt) {
+  G.time += dt;
+  G.timer += dt;
+  for (let k = 0; k < 4; k++) {
+    G.flying = G.flying.filter(s => stepStone(s, dt / 4));
+    for (const m of G.mangoes) stepMango(m, dt / 4);
+  }
+  if (G.swing >= 0) {
+    G.swing += dt / .2;
+    if (!G.released && G.swing > .55) { G.released = true; launch(); }
+    if (G.swing >= 1.8) { G.swing = -1; G.power = G.keyPower || 0; }
+  }
+  if (G.phase === 'play') G.noise = Math.max(0, G.noise - NOISE_DECAY * dt);
+  updateUncle(dt);
+  updateSister(dt);
+  updateCrow(dt);
+  updateDog(dt);
+  updateTree(dt);
+  updateParts(dt);
+  if (G.phase === 'play' && G.stones <= 0 && settled()) finish();
+  if (G.phase === 'caught') {
+    if (G.timer > .45) {
+      const b = G.boy, dx = EXIT.x - b.x, dy = EXIT.y - b.y, d = Math.hypot(dx, dy);
+      if (d > .1) { b.x += dx / d * 5 * dt; b.y += dy / d * 5 * dt; b.walk += dt * 16; } else b.gone = true;
+    }
+    if (G.timer > 1.6 && G.status.endsWith('run!')) {
+      if (G.points > G.best) { G.best = G.points; saveBest(G.best); }
+      const how = G.caughtBy === 'dog' ? 'chased out by the dog! you kept ' : 'caught! you ran off with ';
+      setStatus(how + G.points + ' points · best ' + G.best + ' · tap to play again');
+    }
+  }
+  const used = 1 - G.stones / STONES;
+  G.dusk = lerp(G.dusk, G.phase === 'done' ? 1 : used * .45, Math.min(1, dt * 1.5));
+  G.koelT -= dt;
+  if (G.koelT <= 0) { G.koelT = 14 + Math.random() * 16; sound('koel', .6, (Math.random() * 2 - 1) * .8); }
+  // the neighbourhood carries on around the yard
+  G.crowsT -= dt;
+  if (G.crowsT <= 0) { G.crowsT = 9 + Math.random() * 16; sound('far-crows', .6, (Math.random() * 2 - 1) * .9); }
+  G.dogsT -= dt;
+  if (G.dogsT <= 0) { G.dogsT = 16 + Math.random() * 24; sound('far-dogs', .6, (Math.random() < .5 ? -1 : 1) * (.5 + Math.random() * .4)); }
+  renderHud();
+}
+
+/* ---------- drawing ---------- */
+// a run of spheres with a colour per position along it, for limbs, cloth bands and mangoes
+function limb(a, b, r0, r1, colorAt, mode = 'solid', shadow = true) {
+  const len = Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
+  const n = Math.max(1, Math.ceil(len / (Math.min(r0, r1) * .45)));
+  for (let k = 0; k <= n; k++) {
+    const t = k / n;
+    sphere(lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t), lerp(r0, r1, t), colorAt(t), mode);
+  }
+  if (shadow) pendingShadows.push(a, r0, b, r1);
+}
+const mix3 = (a, b, t) => [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)];
+function drawUncle() {
+  const u = G.uncle, w = ease(u.wake), stir = u.stir, top = COT.z + .02, cy = COT_Y;
+  const breathe = (1 - w) * Math.sin(G.time * 1.85) * .03;
+  const hip = [COT.x0 + 1.45, cy, top + .26];
+  const sh = mix3([COT.x0 + .8, cy, top + .3], [hip[0] - .12, cy, hip[2] + .88], w);
+  const head = mix3([COT.x0 + .42, cy + stir * .06, top + .4], [hip[0] - .08, cy + .04, hip[2] + 1.24], w);
+  const knee = [COT.x0 + 1.95, cy, top + .22], foot = [COT.x1 - .02, cy, top + .2];
+  limb(hip, knee, .26, .2, t => (t * 3 | 0) % 2 ? LUNGI_B : LUNGI);
+  limb(knee, foot, .11, .1, () => UNCLE.skin);
+  limb(foot, [foot[0] + .02, cy, foot[2] + .16], .09, .08, () => UNCLE.skin);
+  limb(hip, sh, .3, .3, () => VEST);
+  const belly = mix3(hip, sh, .45);
+  sphere(belly[0], belly[1], belly[2] + .08 + breathe, .33 + breathe, VEST, 'solid');
+  limb(sh, head, .1, .1, () => UNCLE.skin);
+  sphere(head[0], head[1], head[2], .24, UNCLE.skin, 'solid');
+  const back = mix3([-.08, 0, -.04], [-.04, 0, .07], w);
+  sphere(head[0] + back[0], head[1] + back[1], head[2] + back[2], .2, UNCLE.hair, 'solid');
+  const tache = mix3([.12, 0, .17], [.17, .1, -.06], w);
+  sphere(head[0] + tache[0], head[1] + tache[1], head[2] + tache[2], .07, UNCLE.hair, 'solid');
+  pendingShadows.push(head, .24, head, .24);
+  // one arm hangs off the charpai, the other rests on his belly; awake, he shakes a fist
+  const nearSh = [sh[0], sh[1] + .32, sh[2]], farSh = [sh[0], sh[1] - .32, sh[2]];
+  const shake = Math.sin(G.time * 18) * .12;
+  const nearEl = mix3([sh[0] + .12 + stir * .1, cy + .74, top + .02 + stir * .2], [sh[0] + .2, cy + .55, sh[2] + .15], w);
+  const nearHand = mix3([sh[0] + .2, cy + .8, top - .38 + stir * .4], [sh[0] + .1, cy + .55, sh[2] + .62 + shake], w);
+  const farEl = mix3([sh[0] + .25, cy - .45, top + .35], [sh[0] + .25, cy - .45, sh[2] - .35], w);
+  const farHand = mix3([hip[0] - .25, cy - .1, top + .62], [hip[0] + .1, cy - .35, hip[2] + .1], w);
+  limb(nearSh, nearEl, .1, .09, () => UNCLE.skin); limb(nearEl, nearHand, .08, .07, () => UNCLE.skin);
+  limb(farSh, farEl, .1, .09, () => UNCLE.skin); limb(farEl, farHand, .08, .07, () => UNCLE.skin);
+  return head;
+}
+function poseBoy() {
+  const breathe = Math.sin(G.time * 1.8) * .012, p = G.power;
+  if (G.phase === 'caught') {
+    const w = Math.sin(G.boy.walk);
+    return { scale: .8, stance: w * .45, lean: .3, armR: -w * .9, armL: w * .9, crouch: .1 };
+  }
+  if (G.swing >= 0) {
+    const t = ease(Math.min(1, G.swing)), back = Math.max(0, G.swing - 1) / .8;
+    const from = -.3 - (G.lastPower || .5) * 1.9;
+    if (G.swing <= 1) return { scale: .8, crouch: .2, lean: lerp(-.1, .35, t), stance: .32, armR: lerp(from, 2.5, t), armL: lerp(.9, -.3, t) };
+    return { scale: .8, crouch: lerp(.2, .05, back), lean: lerp(.35, .05, back), stance: lerp(.32, .22, back), armR: lerp(2.5, .1, ease(back)), armL: lerp(-.3, .1, back) };
+  }
+  if (G.phase === 'play' && G.stones > 0) {
+    return { scale: .8, crouch: .08 + p * .22, lean: -.04 - p * .16 + breathe, stance: .22 + p * .12, armR: -.3 - p * 1.9, armL: .5 + p * .7 };
+  }
+  return { scale: .8, armR: .05 + breathe, armL: .1, stance: .12, lean: breathe };
+}
+function poseSister(s) {
+  const k = { scale: .62 };
+  if (s.state === 'pick' || s.state === 'drop') {
+    const c = Math.sin(Math.min(1, s.t / .3) * Math.PI);
+    return { ...k, crouch: c * .8, lean: c * .6, stance: .15, armR: .5 + c * .5, armL: .4 + c * .4 };
+  }
+  const moving = s.path.length > 0 && s.state !== 'idle';
+  const w = Math.sin(s.walk), carry = s.mango && s.state === 'back';
+  if (s.state === 'flee') return { ...k, stance: w * .45, lean: .3, armR: s.basket ? 1.1 : -w * .9, armL: s.basket ? 1.1 : w * .9 };
+  if (moving) return { ...k, stance: w * .32, lean: .12, armR: carry ? 1.2 : -w * .6, armL: carry ? 1.1 : w * .6 };
+  const b = Math.sin(G.time * 2.2) * .015;
+  return { ...k, stance: .1, armR: .1 + b, armL: .12, lean: b };
+}
+function mangoColors(m) {
+  return m.ripe ? t => (t < .18 ? RIPE_TOP : t < .65 ? RIPE : RIPE_LOW) : t => (t < .3 ? RAW_TOP : RAW);
+}
+function drawMango(m, x, y, z, windT) {
+  let tilt = m.tilt, heading = m.heading;
+  if (m.state === 'hang') {
+    const sway = STILL ? 0 : Math.sin(windT * 1.4 + m.hx * 2) * .12 + Math.sin(G.time * 30) * m.wobble * .5;
+    x += sway * .3; tilt = sway;
+    // the stalk, a single dark line up into the leaves
+    const a = project(m.hx, m.hy, m.hz), b = project(x, y, z + .2), n = Math.ceil(Math.abs(a.sy - b.sy)) + 1;
+    for (let k = 0; k <= n; k++) {
+      const t = k / n, ix = Math.round(lerp(a.sx, b.sx, t)), iy = Math.round(lerp(a.sy, b.sy, t)), d = lerp(a.d, b.d, t) + .3;
+      if (ix < 0 || iy < 0 || ix >= W || iy >= H) continue;
+      const i = iy * W + ix;
+      if (d > zb[i]) { zb[i] = d; pix[i] = STALK_C; }
+    }
+  }
+  const ax = Math.sin(tilt) * Math.cos(heading) * .15, ay = Math.sin(tilt) * Math.sin(heading) * .15, az = Math.cos(tilt) * .15;
+  limb([x + ax, y + ay, z + az], [x - ax, y - ay, z - az], MANGO_R, MANGO_R * .8, mangoColors(m), 'solid', false);
+  castShadow(x, y, z, MANGO_R * .9, 1, 0);
+  if (m.state !== 'hang' && z < .5) castShadow(x, y, 0, MANGO_R * .7, 2, 0);
+}
+function drawBasket(bx, by) {
+  const N = 12, ring = (k, r, z) => [bx + Math.cos(k / N * 6.283) * r, by + Math.sin(k / N * 6.283) * r, z];
+  slab(bx - .5, by - .5, bx + .5, by + .5, .08, (a, b) => Math.hypot(a - bx, b - by) < .44 ? BASKET_FLOOR : 0);
+  for (let k = 0; k < N; k++) limb(ring(k, .44, .06), ring(k, .56, .5), .09, .1, t => (t < .5 ? CANE_DARK : CANE), 'solid', false);
+  for (let k = 0; k < N; k++) limb(ring(k, .57, .52), ring(k + 1, .57, .52), .07, .07, () => CANE_RIM, 'solid', false);
+  castShadow(bx, by, .3, .58);
+  // the haul, piled up
+  G.basket.forEach((m, j) => {
+    const layer = j < 6 ? 0 : j < 11 ? 1 : 2, slot = layer === 0 ? j : layer === 1 ? j - 6 : j - 11;
+    const r = [.26, .17, .08][layer], a = slot * 1.256 + layer * .6;
+    const z = .3 + layer * .17 + (layer === 2 ? Math.floor(slot / 5) * .15 : 0);
+    sphere(bx + Math.cos(a) * r, by + Math.sin(a) * r, z, .19, m.ripe ? RIPE : RAW, 'gloss');
+  });
+}
+const Z_SMALL = ['xxxx', '..x.', '.x..', 'xxxx'];
+const Z_BIG = ['xxxxx', '...x.', '..x..', '.x...', 'xxxxx'];
+const BANG = ['.ooo.', '.oXo.', '.oXo.', '.oXo.', '.oXo.', '.ooo.', '.oXo.', '.ooo.'];
+function glyph(rows, left, top, ink, fill) {
+  const a = [], b = [];
+  rows.forEach((row, y) => [...row].forEach((c, x) => {
+    if (c === 'x' || c === 'o') a.push([left + x, top + y]);
+    if (c === 'X') b.push([left + x, top + y]);
+  }));
+  drawDots(a, ink);
+  if (fill) drawDots(b, fill);
+  return a;
+}
+function drawAim() {
+  if (G.phase !== 'play' || G.swing >= 0 || G.power < .08 || G.stones <= 0) return;
+  const fx = Math.cos(G.yaw), fy = Math.sin(G.yaw), v = G.power * MAX_SPEED, h = v * Math.cos(ELEVATION);
+  let x = PLAYER.x + fx * .3, y = PLAYER.y + fy * .3, z = RELEASE_Z, vz = v * Math.sin(ELEVATION);
+  const light = rgb(255, 246, 214);
+  for (let k = 0; k < 26; k++) {
+    x += fx * h * .03; y += fy * h * .03; vz -= GRAVITY * .03; z += vz * .03;
+    if (z <= 0 || inCanopy(x, y, z)) break;
+    if (k % 2) continue;
+    const p = project(x, y, z), ix = p.sx | 0, iy = p.sy | 0;
+    if (ix < 0 || iy < 0 || ix >= W || iy + 1 >= H) continue;
+    pix[(iy + 1) * W + ix] = INK;
+    pix[iy * W + ix] = light;
+  }
+}
+function drawParts() {
+  for (const p of G.parts) {
+    const q = project(p.x, p.y, p.z), ix = q.sx | 0, iy = q.sy | 0;
+    if (ix < 0 || iy < 0 || ix + 1 >= W || iy >= H) continue;
+    const i = iy * W + ix;
+    if (q.d + .2 <= zb[i]) continue;
+    pix[i] = p.color;
+    if (p.kind === 'leaf') pix[i + 1] = p.color;
+  }
+}
+function warmLight() {
+  // the afternoon slides toward evening as the stones run out
+  const k = G.dusk * .16;
+  if (k < .005) return;
+  for (let i = 0; i < pix.length; i++) {
+    const c = pix[i];
+    if (c === WHITE) continue;
+    const r = c & 255, g = c >> 8 & 255, b = c >> 16 & 255;
+    pix[i] = rgb(r + (255 - r) * k * .35, g * (1 - k * .25), b * (1 - k * .9));
+  }
+}
+function draw() {
+  pix.set(bakedPix);
+  zb.set(bakedZ);
+  pendingShadows.length = 0;
+  const windT = STILL ? 0 : Math.floor(G.time * WIND_FPS) / WIND_FPS;
+  const head = drawUncle();
+  const boy = G.boy, s = G.sister;
+  let hand = null;
+  if (!boy.gone) {
+    const yaw = G.phase === 'caught' ? Math.atan2(EXIT.y - boy.y, EXIT.x - boy.x) : G.yaw;
+    hand = figure(boy.x, boy.y, yaw, poseBoy(), BOY, dynamicAdd);
+  }
+  if (!s.gone) {
+    const sHand = figure(s.x, s.y, s.yaw, poseSister(s), GIRL, dynamicAdd);
+    if (s.mango && (s.state === 'back' || s.state === 'drop')) { s.mango.x = sHand[0]; s.mango.y = sHand[1]; s.mango.z = sHand[2] + .05; }
+    if (s.basket) drawBasket(s.x + Math.cos(s.yaw) * .35, s.y + Math.sin(s.yaw) * .35);
+  }
+  if (!s.basket) drawBasket(BASKET.x, BASKET.y);
+  // the next stone, held until the throw lets go
+  if (hand && G.phase === 'play' && G.stones > 0 && !(G.released && G.swing >= 0 && G.swing < 1.8)) {
+    sphere(hand[0], hand[1], hand[2], STONE_R, STONE_C, 'solid');
+  }
+  for (const m of G.mangoes) {
+    if (m.state === 'basket') continue;
+    if (s.gone && m.state === 'carried') continue;
+    drawMango(m, m.x, m.y, m.z, windT);
+  }
+  for (const p of G.pebbles) sphere(p.x, p.y, p.z, STONE_R * .9, STONE_C, 'rough');
+  for (const st of G.flying) {
+    sphere(st.x, st.y, st.z, STONE_R, STONE_C, 'solid');
+    castShadow(st.x, st.y, st.z, STONE_R, 1, 0);
+  }
+  drawCrow();
+  drawDog();
+  drawLeaves(windT, STILL ? 0 : G.shake, G.time);
+  drawTufts(windT);
+  drawParts();
+  flushShadows();
+  applyShadows(bakedZ);
+  shadeEdges();
+  drawAim();
+  drawDogBark();
+  drawBirds();
+  // zzz drifting up from the charpai, or a warning when he wakes
+  const hp = project(head[0], head[1], head[2] + .3);
+  for (const z of G.zzz) {
+    const rows = z.big ? Z_BIG : Z_SMALL;
+    glyph(rows, Math.round(hp.sx + 3 + z.t * 5 + Math.sin(z.t * 3) * 2), Math.round(hp.sy - 6 - z.t * 9), rgb(108, 112, 150));
+  }
+  if (G.uncle.wake > 0 && Math.floor(G.time * 6) % 2 === 0) {
+    const ink = glyph(BANG, Math.round(hp.sx) - 2, Math.round(hp.sy) - 16, INK, SIGNAL);
+    haloDots(ink.filter(([x, y]) => y === Math.round(hp.sy) - 16));
+  } else if (G.uncle.stirring && G.phase === 'play') {
+    drawArrow(hp.sx, hp.sy - 4, G.time);
+  }
+  warmLight();
+  ctx.putImageData(image, 0, 0);
+}
+
+/* ---------- input ---------- */
+function toCanvas(e) {
+  const r = canvas.getBoundingClientRect();
+  return { x: (e.clientX - r.left) * W / r.width, y: (e.clientY - r.top) * H / r.height };
+}
+const canRestart = () => (G.phase === 'done' || G.phase === 'caught') && G.timer > 1.2;
+canvas.addEventListener('pointerdown', e => {
+  ensureAudio();
+  canvas.focus({ preventScroll: true });
+  if (canRestart()) return reset();
+  if (G.phase !== 'play' || G.stones <= 0) return;
+  canvas.setPointerCapture(e.pointerId);
+  G.pointer = toCanvas(e);
+  if (G.swing < 0) G.power = 0;
+});
+canvas.addEventListener('pointermove', e => {
+  if (!G.pointer || G.swing >= 0) return;
+  const p = toCanvas(e);
+  const dx = (p.x - G.pointer.x) / S, dy = (p.y - G.pointer.y) / (S * SIN);
+  const wx = (dx + dy) / R2, wy = (dy - dx) / R2, len = Math.hypot(wx, wy);
+  G.power = clamp(len / 16, 0, 1);
+  if (len > .4) G.yaw = Math.atan2(-wy, -wx);
+});
+const endDrag = () => {
+  if (!G.pointer) return;
+  G.pointer = null;
+  G.lastPower = G.power;
+  G.keyPower = 0;
+  release();
+};
+canvas.addEventListener('pointerup', endDrag);
+canvas.addEventListener('pointercancel', () => { G.pointer = null; if (G.swing < 0) G.power = 0; });
+canvas.addEventListener('keydown', e => {
+  ensureAudio();
+  if (e.key === ' ' || e.key === 'Enter') {
+    e.preventDefault();
+    if (canRestart()) return reset();
+    G.lastPower = G.power;
+    G.keyPower = G.power; // keep the keyboard aim for the next stone
+    release();
+    return;
+  }
+  if (G.phase !== 'play' || G.swing >= 0) return;
+  if (e.key === 'ArrowLeft') G.yaw -= .02;
+  else if (e.key === 'ArrowRight') G.yaw += .02;
+  else if (e.key === 'ArrowUp') G.power = clamp(G.power + .015, 0, 1);
+  else if (e.key === 'ArrowDown') G.power = clamp(G.power - .015, 0, 1);
+  else return;
+  e.preventDefault();
+});
+
+/* ---------- sound ---------- */
+// everything is synthesised: no audio files
+let audio = null, master = null, hissBuffer = null, muted = false;
+const CAW_VOL = .8, BARK_VOL = .4;
+const cotPan = () => panAt((COT.x0 + COT.x1) / 2, COT_Y, .6);
+function ensureAudio() {
+  if (audio) { if (audio.state === 'suspended') audio.resume(); return; }
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return;
+  audio = new AC();
+  master = audio.createGain();
+  master.gain.value = muted ? 0 : 1;
+  master.connect(audio.destination);
+  hissBuffer = audio.createBuffer(1, audio.sampleRate, audio.sampleRate);
+  const data = hissBuffer.getChannelData(0);
+  for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+  loadSamples();
+}
+
+/* recorded sounds, with the synthesised ones as a fallback while they load or if one fails */
+const SAMPLES = {
+  crow: 'kave_msri-crow-sfx-318131.mp3',            // three caws, at .25s, .95s and 1.65s
+  dog: 'mixkit-dog-barking-twice-1.wav',            // two barks, at 0s and .85s
+  flock: 'freesound_community-birds-taking-off-fly-6277.mp3',
+  yard: 'oxidvideos-chirping-birds-ambience-217410.mp3', // a long loop of birdsong for the whole afternoon
+};
+const CROW_CALLS = [[.2, .42], [.9, .38], [1.6, .4]], DOG_BARKS = [[0, .32], [.82, .34]];
+const SAMPLE_VOL = { crow: .32, dog: .3, flock: .9, yard: .8 };
+const samples = {};
+function loadSamples() {
+  for (const [name, file] of Object.entries(SAMPLES)) {
+    fetch(file).then(r => r.arrayBuffer()).then(b => audio.decodeAudioData(b)).then(buf => {
+      samples[name] = buf;
+      if (name === 'yard') startYard();
+    }).catch(() => { if (name === 'yard') startCicadas(); });
+  }
+}
+// play part of a recording through the current bus; false if it has not loaded, so the caller can synthesise instead
+function play(name, { offset = 0, dur = 0, vol = 1, rate = 1, when = 0 } = {}) {
+  const buf = samples[name];
+  if (!buf) return false;
+  const t = audio.currentTime + when, src = audio.createBufferSource(), g = audio.createGain();
+  src.buffer = buf;
+  src.playbackRate.value = rate;
+  const level = vol * SAMPLE_VOL[name], length = (dur || buf.duration - offset) / rate;
+  g.gain.setValueAtTime(level, t);
+  g.gain.setValueAtTime(level, t + Math.max(0, length - .05));
+  g.gain.linearRampToValueAtTime(0, t + length);
+  src.connect(g).connect(bus);
+  src.start(t, offset, dur || undefined);
+  return true;
+}
+// a run of single calls cut from a recording, each a touch different in pitch
+function calls(name, cuts, n, vol, rate, gap) {
+  let when = 0, ok = true;
+  for (let k = 0; k < n && ok; k++) {
+    const [offset, dur] = cuts[(Math.random() * cuts.length) | 0], r = rate * (1 + (Math.random() - .5) * .06);
+    ok = play(name, { offset, dur, vol: vol * (1 - k * .06), rate: r, when });
+    when += dur / r + gap * (.8 + Math.random() * .4);
+  }
+  return ok;
+}
+function startYard() {
+  const src = audio.createBufferSource(), g = audio.createGain();
+  src.buffer = samples.yard; src.loop = true;
+  g.gain.value = SAMPLE_VOL.yard;
+  src.connect(g).connect(master);
+  src.start(0, Math.random() * samples.yard.duration);
+}
+// every sound plays through a bus placed where it happens: panned left or right across the yard,
+// and muffled when it comes from next door (far 1) or down the lane (far 2)
+const buses = new Map();
+let bus = null;
+function busFor(pan, far = 0) {
+  const step = Math.round(clamp(pan, -1, 1) * 5), key = step + '|' + far;
+  let node = buses.get(key);
+  if (node) return node;
+  node = audio.createGain();
+  let tail = node;
+  if (far) {
+    const lp = audio.createBiquadFilter();
+    lp.type = 'lowpass'; lp.frequency.value = far > 1 ? 1000 : 1900;
+    node.gain.value = far > 1 ? .5 : .75;
+    tail.connect(lp); tail = lp;
+  }
+  if (audio.createStereoPanner) {
+    const p = audio.createStereoPanner();
+    p.pan.value = step / 5;
+    tail.connect(p); tail = p;
+  }
+  tail.connect(master);
+  buses.set(key, node);
+  return node;
+}
+// where a point in the yard sits on screen, as a stereo position
+const panAt = (x, y, z = 0) => clamp((project(x, y, z).sx - W / 2) / (W / 2), -1, 1) * .8;
+function tone(f0, f1, dur, vol, type = 'sine', when = 0) {
+  const now = audio.currentTime + when, osc = audio.createOscillator(), g = audio.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(f0, now);
+  osc.frequency.exponentialRampToValueAtTime(f1, now + dur);
+  g.gain.setValueAtTime(.0001, now);
+  g.gain.linearRampToValueAtTime(vol, now + Math.min(.015, dur * .3));
+  g.gain.exponentialRampToValueAtTime(.0005, now + dur);
+  osc.connect(g).connect(bus);
+  osc.start(now); osc.stop(now + dur + .02);
+}
+function hiss(dur, vol, freq, q = 1, type = 'bandpass', when = 0) {
+  const now = audio.currentTime + when, src = audio.createBufferSource(), f = audio.createBiquadFilter(), g = audio.createGain();
+  src.buffer = hissBuffer;
+  f.type = type; f.frequency.value = freq; f.Q.value = q;
+  g.gain.setValueAtTime(.0001, now);
+  g.gain.linearRampToValueAtTime(vol, now + Math.min(.03, dur * .3));
+  g.gain.exponentialRampToValueAtTime(.0005, now + dur);
+  src.connect(f).connect(g).connect(bus);
+  src.start(now, Math.random() * .5); src.stop(now + dur + .02);
+}
+// a voice: a buzzy source shaped by a few resonances, the way a throat and mouth shape a call
+function formants(source, list, env) {
+  for (const [f, q, g] of list) {
+    const bp = audio.createBiquadFilter(), gain = audio.createGain();
+    bp.type = 'bandpass'; bp.frequency.value = f; bp.Q.value = q; gain.gain.value = g;
+    source.connect(bp).connect(gain).connect(env);
+  }
+}
+function envelope(t, vol, attack, hold, end) {
+  const env = audio.createGain();
+  env.gain.setValueAtTime(.0001, t);
+  env.gain.linearRampToValueAtTime(vol, t + attack);
+  env.gain.setValueAtTime(vol, t + hold);
+  env.gain.exponentialRampToValueAtTime(.0005, t + end);
+  env.connect(bus);
+  return env;
+}
+// one crow "caa": a harsh nasal call, rising then falling, with a fast flutter that makes it rasp
+function caw(when, vol, pitch) {
+  const t = audio.currentTime + when, dur = .2 + Math.random() * .1;
+  const osc = audio.createOscillator(), flutter = audio.createOscillator(), depth = audio.createGain(), body = audio.createGain();
+  osc.type = 'sawtooth';
+  osc.frequency.setValueAtTime(500 * pitch, t);
+  osc.frequency.linearRampToValueAtTime(600 * pitch, t + .05);
+  osc.frequency.exponentialRampToValueAtTime(410 * pitch, t + dur);
+  flutter.type = 'square'; flutter.frequency.value = 62 + Math.random() * 18;
+  depth.gain.value = .4; body.gain.value = .6;
+  flutter.connect(depth).connect(body.gain);
+  osc.connect(body);
+  formants(body, [[1250 * pitch, 4, 1], [2500 * pitch, 6, .6], [720, 3, .35]], envelope(t, vol, .02, dur * .55, dur));
+  osc.start(t); flutter.start(t); osc.stop(t + dur + .03); flutter.stop(t + dur + .03);
+  hiss(dur * .9, vol * .15, 2100, 2, 'bandpass', when);
+}
+function caws(n, vol, pitch, gap = .36, when = 0) {
+  for (let k = 0; k < n; k++) caw(when + k * gap * (.9 + Math.random() * .25), vol * (1 - k * .07), pitch * (1 + (Math.random() - .5) * .05));
+}
+// one dog "woof": a puff of breath, then a short gruff bark that drops in pitch
+let growlCurve = null;
+function woof(when, vol, pitch) {
+  const t = audio.currentTime + when, dur = .13 + Math.random() * .04;
+  const osc = audio.createOscillator(), drive = audio.createWaveShaper();
+  if (!growlCurve) {
+    growlCurve = new Float32Array(256);
+    for (let i = 0; i < 256; i++) growlCurve[i] = Math.tanh((i / 128 - 1) * 3) / Math.tanh(3);
+  }
+  drive.curve = growlCurve;
+  osc.type = 'sawtooth';
+  osc.frequency.setValueAtTime(330 * pitch, t);
+  osc.frequency.linearRampToValueAtTime(480 * pitch, t + .02);
+  osc.frequency.exponentialRampToValueAtTime(190 * pitch, t + dur);
+  osc.connect(drive);
+  formants(drive, [[640 * pitch, 2, 1], [1500 * pitch, 3, .45], [260 * pitch, 2, .5]], envelope(t, vol, .008, .03, dur));
+  osc.start(t); osc.stop(t + dur + .03);
+  hiss(.05, vol * .5, 1100, 1, 'bandpass', when);
+}
+function barks(n, vol, pitch, when = 0) {
+  let at = when;
+  for (let k = 0; k < n; k++) {
+    woof(at, vol * (1 - k * .06), pitch * (1 + (Math.random() - .5) * .06));
+    at += .18 + Math.random() * .16;
+  }
+}
+function growl(vol) {
+  const t = audio.currentTime, dur = .9;
+  const osc = audio.createOscillator(), flutter = audio.createOscillator(), depth = audio.createGain(), body = audio.createGain();
+  osc.type = 'sawtooth';
+  osc.frequency.setValueAtTime(84, t); osc.frequency.linearRampToValueAtTime(96, t + .3); osc.frequency.linearRampToValueAtTime(80, t + dur);
+  flutter.frequency.value = 24; depth.gain.value = .45; body.gain.value = .55;
+  flutter.connect(depth).connect(body.gain);
+  osc.connect(body);
+  formants(body, [[420, 1.5, 1], [900, 3, .3]], envelope(t, vol, .12, .55, dur));
+  osc.start(t); flutter.start(t); osc.stop(t + dur + .03); flutter.stop(t + dur + .03);
+}
+function startCicadas() {
+  // the summer-afternoon drone, pulsing slowly
+  const src = audio.createBufferSource(), f = audio.createBiquadFilter(), g = audio.createGain();
+  const lfo = audio.createOscillator(), depth = audio.createGain(), swell = audio.createOscillator(), swellDepth = audio.createGain();
+  src.buffer = hissBuffer; src.loop = true;
+  f.type = 'bandpass'; f.frequency.value = 5200; f.Q.value = 9;
+  g.gain.value = .02;
+  lfo.frequency.value = 21; depth.gain.value = .012;
+  swell.frequency.value = .09; swellDepth.gain.value = .012;
+  lfo.connect(depth).connect(g.gain);
+  swell.connect(swellDepth).connect(g.gain);
+  src.connect(f).connect(g).connect(master);
+  src.start(); lfo.start(); swell.start();
+}
+function sound(kind, amount = .6, pan = 0) {
+  if (!audio) return;
+  bus = busFor(pan);
+  if (kind === 'whoosh') hiss(.2, .07, 700, 1.4);
+  else if (kind === 'rustle') { hiss(.25, .06 * amount + .03, 3600, .7, 'highpass'); hiss(.18, .04, 1900, 2, 'bandpass', .06); }
+  else if (kind === 'snap') tone(1900, 1100, .035, .1, 'square');
+  else if (kind === 'tok') { tone(560, 300, .08, .2 * amount + .07, 'triangle'); hiss(.04, .07, 1500, 3); }
+  else if (kind === 'thump') { tone(140, 60, .15, .32 * amount + .1); hiss(.07, .05, 500, 1); }
+  else if (kind === 'thud') tone(230, 110, .06, .12 * amount + .03);
+  else if (kind === 'clack') { tone(1300, 650, .05, .14, 'square'); hiss(.05, .07, 2600, 2); }
+  else if (kind === 'creak') { tone(250, 180, .25, .06, 'sawtooth'); tone(320, 260, .15, .03, 'sawtooth', .08); }
+  else if (kind === 'pop') { tone(520, 760, .07, .09, 'triangle'); tone(780, 1050, .08, .07, 'triangle', .06); }
+  else if (kind === 'grunt') tone(130, 92, .4, .09, 'sawtooth');
+  else if (kind === 'bonk') { tone(420, 180, .12, .2, 'square'); }
+  else if (kind === 'shout') { tone(300, 450, .14, .14, 'square'); tone(450, 280, .34, .14, 'square', .14); }
+  else if (kind === 'snore') { hiss(1.1, .035, 260, 1.5, 'lowpass'); tone(68, 58, 1.1, .02, 'sawtooth'); }
+  else if (kind === 'evening') [523, 659, 784, 1046].forEach((f, k) => tone(f, f * 1.002, .35, .06, 'triangle', k * .14));
+  // the yard crow: an idle "caa caa", or the full startled "caa caa caa", a little higher
+  else if (kind === 'caw') {
+    const n = 1 + (Math.random() < .6) + (Math.random() < .25);
+    calls('crow', CROW_CALLS, n, amount * 1.3, 1, .25) || caws(n + 1, CAW_VOL * amount, 1);
+  }
+  else if (kind === 'alarm') play('crow', { offset: .2, dur: 1.8, vol: 1.2, rate: 1.08 }) || caws(4, CAW_VOL * 1.1, 1.08, .24);
+  // the yard dog: one or two woofs at a time
+  else if (kind === 'bark') calls('dog', DOG_BARKS, Math.random() < .5 ? 2 : 1, 1, 1, .12) || barks(Math.random() < .5 ? 2 : 1, BARK_VOL, 1);
+  else if (kind === 'growl') growl(BARK_VOL * .5);
+  else if (kind === 'yelp') { tone(900, 1500, .1, .08, 'triangle'); tone(1300, 900, .14, .06, 'triangle', .09); }
+  // a flock bursting out of the tree
+  else if (kind === 'flock') play('flock', { vol: amount * 1.4, rate: .95 + Math.random() * .1 }) || hiss(.9, .06, 2400, .8, 'bandpass');
+  // the neighbourhood: crows in other trees, dogs down the lane, sometimes another dog answering
+  else if (kind === 'far-crows') {
+    bus = busFor(pan, 1 + (Math.random() < .5));
+    const n = 1 + (Math.random() * 3 | 0), rate = .88 + Math.random() * .2;
+    calls('crow', CROW_CALLS, n, .5, rate, .3) || caws(n + 1, CAW_VOL * .55, rate, .32 + Math.random() * .12);
+  }
+  else if (kind === 'far-dogs') {
+    const rate = .8 + Math.random() * .35, n = 2 + (Math.random() * 2 | 0);
+    bus = busFor(pan, 2);
+    calls('dog', DOG_BARKS, n, .8, rate, .25) || barks(n, BARK_VOL * .6, rate);
+    if (Math.random() < .45) {
+      bus = busFor(-pan, 2);
+      const answer = rate * (1.12 + Math.random() * .2);
+      if (samples.dog) setTimeout(() => { bus = busFor(-pan, 2); calls('dog', DOG_BARKS, 2, .6, answer, .2); }, 1400);
+      else barks(2, BARK_VOL * .45, answer, 1.3);
+    }
+  }
+  else if (kind === 'koel') {
+    bus = busFor(pan, 1);
+    // the koel: a rising two-note call, each one a little higher
+    [0, 1, 2, 3].forEach(k => {
+      const f = 640 + k * 70;
+      tone(f, f * 1.04, .16, .07, 'sine', k * .62);
+      tone(f * 1.06, f * 1.42, .3, .08, 'sine', k * .62 + .17);
+    });
+  }
+}
+const muteButton = document.getElementById('mute');
+muteButton.addEventListener('click', () => {
+  muted = !muted;
+  if (master) master.gain.value = muted ? 0 : 1;
+  muteButton.textContent = muted ? 'sound off' : 'sound on';
+  muteButton.setAttribute('aria-pressed', String(muted));
+});
+document.addEventListener('visibilitychange', () => {
+  if (!audio) return;
+  if (document.hidden) audio.suspend(); else audio.resume();
+});
+
+/* ---------- boot ---------- */
+addEventListener('resize', fit);
+fit();
+bake();
+reset();
+let last = performance.now();
+function frame(now) {
+  update(Math.min(.04, (now - last) / 1000));
+  last = now;
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+window.__mango = { G, reset, step(dt, skipDraw) { update(dt); if (!skipDraw) draw(); } };
+</script>
+</body>
+</html>
