@@ -1,5 +1,7 @@
 # Pixel Games
 
+**Play: https://sahilm2063.github.io/pixel-games/**
+
 Small nostalgic browser games drawn as isometric pixel dioramas, in plain JavaScript with no build step and no image files.
 
 ## Games
